@@ -9,11 +9,6 @@ use std::{
 use threadpool::ThreadPool;
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
-    // Uncomment this block to pass the first stage
-    //
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     let pool = ThreadPool::new(4);
     let store = Arc::new(Mutex::new(Store::new()));
@@ -150,6 +145,32 @@ impl Store {
             _ => 0, // Key doesn't exist or is not a list
         }
     }
+
+    fn lpop(&mut self, key: &str, count: Option<usize>) -> Option<Vec<String>> {
+        match self.data.get_mut(key) {
+            Some(Value::List(list)) => {
+                if list.is_empty() {
+                    return None;
+                }
+
+                let count = count.unwrap_or(1);
+                let pop_count = count.min(list.len());
+
+                let mut result = Vec::new();
+                for _ in 0..pop_count {
+                    result.push(list.remove(0));
+                }
+
+                // Remove the key if the list is now empty
+                if list.is_empty() {
+                    self.data.remove(key);
+                }
+
+                Some(result)
+            }
+            _ => None, // Key doesn't exist or is not a list
+        }
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
@@ -223,6 +244,27 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     let response = format!(":{}\r\n", len);
                     stream.write_all(response.as_bytes())
                 }
+                Command::LPop(key, count) => {
+                    let mut store = store.lock().unwrap();
+                    if let Some(values) = store.lpop(&key, count) {
+                        if count.is_some() {
+                            // With count: return array
+                            let mut response = format!("*{}\r\n", values.len());
+                            for value in values {
+                                response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                            }
+                            stream.write_all(response.as_bytes())
+                        } else {
+                            // Without count: return single bulk string
+                            let value = &values[0];
+                            let response = format!("${}\r\n{}\r\n", value.len(), value);
+                            stream.write_all(response.as_bytes())
+                        }
+                    } else {
+                        // Key doesn't exist or is empty
+                        stream.write_all(b"$-1\r\n")
+                    }
+                }
             };
 
             if result.is_err() {
@@ -241,6 +283,7 @@ enum Command {
     LPush(String, Vec<String>), // key, values
     LRange(String, i64, i64), // key, start, stop
     LLen(String), // key
+    LPop(String, Option<usize>), // key, optional count
 }
 
 struct Parser<'a> {
@@ -378,6 +421,16 @@ impl<'a> Parser<'a> {
                 let key = self.read_bulk_string()?;
                 Some(Command::LLen(key))
             }
+            "LPOP" => {
+                let key = self.read_bulk_string()?;
+                // Check for optional count argument
+                let count = if let Some(count_str) = self.read_bulk_string() {
+                    count_str.parse::<usize>().ok()
+                } else {
+                    None
+                };
+                Some(Command::LPop(key, count))
+            }
             _ => None,
         }
     }
@@ -411,7 +464,8 @@ mod tests {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
         let handle = thread::spawn(move || {
             let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
-            let pool = ThreadPool::new(4);
+            println!("Listening on port {}", port);
+            let pool = ThreadPool::new(10);
             let store = Arc::new(Mutex::new(Store::new()));
 
             for stream in listener.incoming() {
@@ -989,5 +1043,144 @@ mod tests {
         // Try to get length - should return 0 since it's not a list
         let response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmykey1\r\n");
         assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_parse_lpop_no_count() {
+        let request = "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LPop(key, count) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(*count, None);
+            }
+            _ => panic!("Expected LPop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lpop_with_count() {
+        let request = "*3\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n$1\r\n3\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LPop(key, count) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(*count, Some(3));
+            }
+            _ => panic!("Expected LPop command"),
+        }
+    }
+
+    #[test]
+    fn test_lpop_single_element() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list
+        send_command(port, "*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+        // Pop one element (default behavior)
+        let response = send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+        assert_eq!(response, "$1\r\na\r\n");
+
+        // Verify list now has 2 elements
+        let llen_response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(llen_response, ":2\r\n");
+    }
+
+    #[test]
+    fn test_lpop_with_count() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 5 elements
+        send_command(port, "*7\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n");
+
+        // Pop 3 elements
+        let response = send_command(port, "*3\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n$1\r\n3\r\n");
+        assert_eq!(response, "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+        // Verify list now has 2 elements (d, e)
+        let lrange_response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(lrange_response, "*2\r\n$1\r\nd\r\n$1\r\ne\r\n");
+    }
+
+    #[test]
+    fn test_lpop_count_exceeds_length() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 2 elements
+        send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n");
+
+        // Pop 5 elements (more than available)
+        let response = send_command(port, "*3\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n$1\r\n5\r\n");
+        assert_eq!(response, "*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+
+        // List should be empty and removed
+        let llen_response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(llen_response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_lpop_nonexistent_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$4\r\nLPOP\r\n$10\r\nnonexistent\r\n");
+        assert_eq!(response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_lpop_empty_list() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create and then empty a list
+        send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n");
+        send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+
+        // Try to pop from empty list
+        let response = send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+        assert_eq!(response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_lpop_removes_key_when_empty() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with one element
+        send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n");
+
+        // Pop the only element
+        send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+
+        // Verify key no longer exists
+        let llen_response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(llen_response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_lpop_order() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Use LPUSH to create list [3, 2, 1]
+        send_command(port, "*5\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n");
+
+        // Pop one element - should get 3
+        let response1 = send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+        assert_eq!(response1, "$1\r\n3\r\n");
+
+        // Pop one more - should get 2
+        let response2 = send_command(port, "*2\r\n$4\r\nLPOP\r\n$6\r\nmylist\r\n");
+        assert_eq!(response2, "$1\r\n2\r\n");
+
+        // Final element should be 1
+        let lrange_response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(lrange_response, "*1\r\n$1\r\n1\r\n");
     }
 }
