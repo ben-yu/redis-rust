@@ -4,6 +4,7 @@ use std::{
     net::{TcpListener, TcpStream},
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use threadpool::ThreadPool;
 
@@ -33,7 +34,7 @@ fn main() {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, String>>>) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, (String, Option<Instant>)>>>) {
     let mut buf = [0; 512];
     loop {
         let bytes_read = stream.read(&mut buf).unwrap();
@@ -50,16 +51,24 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, Str
                     let response = format!("${}\r\n{}\r\n", msg.len(), msg);
                     stream.write_all(response.as_bytes()).unwrap();
                 }
-                Command::Set(key, value) => {
+                Command::Set(key, value, expiry_ms) => {
                     let mut store = store.lock().unwrap();
-                    store.insert(key, value);
+                    let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+                    store.insert(key, (value, expiry));
                     stream.write_all(b"+OK\r\n").unwrap();
                 }
                 Command::Get(key) => {
-                    let store = store.lock().unwrap();
-                    if let Some(value) = store.get(&key) {
-                        let response = format!("${}\r\n{}\r\n", value.len(), value);
-                        stream.write_all(response.as_bytes()).unwrap();
+                    let mut store = store.lock().unwrap();
+                    if let Some((value, expiry)) = store.get(&key) {
+                        // Check if key has expired
+                        if expiry.map_or(false, |exp| Instant::now() > exp) {
+                            // Key expired, remove it
+                            store.remove(&key);
+                            stream.write_all(b"$-1\r\n").unwrap();
+                        } else {
+                            let response = format!("${}\r\n{}\r\n", value.len(), value);
+                            stream.write_all(response.as_bytes()).unwrap();
+                        }
                     } else {
                         stream.write_all(b"$-1\r\n").unwrap();
                     }
@@ -72,7 +81,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, Str
 enum Command {
     Ping,
     Echo(String),
-    Set(String, String),
+    Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
 }
 
@@ -117,8 +126,32 @@ fn parse_commands(request: &str) -> Vec<Command> {
                                         i += 1;
                                         if i < lines.len() {
                                             let value = lines[i].to_string();
-                                            commands.push(Command::Set(key, value));
                                             i += 1;
+
+                                            // Check for PX (milliseconds) or EX (seconds) flag
+                                            let mut expiry_ms = None;
+                                            if i < lines.len() && lines[i].starts_with('$') {
+                                                i += 1;
+                                                if i < lines.len() {
+                                                    let flag = lines[i].to_uppercase();
+                                                    i += 1;
+
+                                                    if flag == "PX" || flag == "EX" {
+                                                        // Get the expiry value
+                                                        if i < lines.len() && lines[i].starts_with('$') {
+                                                            i += 1;
+                                                            if i < lines.len() {
+                                                                if let Ok(val) = lines[i].parse::<u64>() {
+                                                                    expiry_ms = Some(if flag == "EX" { val * 1000 } else { val });
+                                                                }
+                                                                i += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            commands.push(Command::Set(key, value, expiry_ms));
                                         }
                                     }
                                 }
