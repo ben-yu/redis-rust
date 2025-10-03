@@ -25,22 +25,19 @@ fn main() {
 }
 
 fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&stream);
-    let request: Vec<_> = buf_reader
-        .lines()
-        .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
+    let mut buf = [0; 512];
+    loop {
+        let bytes_read = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..bytes_read]);
 
-    // Count PING commands in the request
-    let ping_count = request.iter()
-        .filter(|line| *line == "*1\r\n$4\r\nPING\r\n")
-        .count();
+        println!("Request: {}", request);
 
-    // Send the same number of PONGs back
-    for _ in 0..ping_count {
-        stream.write_all(b"+PONG\r\n").unwrap();
+        // Count PING commands in the request
+        let ping_count = request.matches("*1\r\n$4\r\nPING\r\n").count();
+
+        // Send the same number of PONGs back
+        for _ in 0..ping_count {
+            stream.write_all(b"+PONG\r\n").unwrap();
+        }
     }
-
-    println!("Request: {:#?}", request);
 }
