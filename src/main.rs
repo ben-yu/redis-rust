@@ -39,8 +39,6 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, Str
         let bytes_read = stream.read(&mut buf).unwrap();
         let request = String::from_utf8_lossy(&buf[..bytes_read]);
 
-        println!("Request: {}", request);
-
         let commands = parse_commands(&request);
 
         for command in commands {
