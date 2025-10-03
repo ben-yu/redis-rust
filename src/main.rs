@@ -37,25 +37,30 @@ fn main() {
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, (String, Option<Instant>)>>>) {
     let mut buf = [0; 512];
     loop {
-        let bytes_read = stream.read(&mut buf).unwrap();
+        let bytes_read = match stream.read(&mut buf) {
+            Ok(0) => break, // Connection closed
+            Ok(n) => n,
+            Err(_) => break, // Error reading
+        };
+
         let request = String::from_utf8_lossy(&buf[..bytes_read]);
 
         let commands = parse_commands(&request);
 
         for command in commands {
-            match command {
+            let result = match command {
                 Command::Ping => {
-                    stream.write_all(b"+PONG\r\n").unwrap();
+                    stream.write_all(b"+PONG\r\n")
                 }
                 Command::Echo(msg) => {
                     let response = format!("${}\r\n{}\r\n", msg.len(), msg);
-                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(response.as_bytes())
                 }
                 Command::Set(key, value, expiry_ms) => {
                     let mut store = store.lock().unwrap();
                     let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
                     store.insert(key, (value, expiry));
-                    stream.write_all(b"+OK\r\n").unwrap();
+                    stream.write_all(b"+OK\r\n")
                 }
                 Command::Get(key) => {
                     let mut store = store.lock().unwrap();
@@ -64,15 +69,19 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, (St
                         if expiry.map_or(false, |exp| Instant::now() > exp) {
                             // Key expired, remove it
                             store.remove(&key);
-                            stream.write_all(b"$-1\r\n").unwrap();
+                            stream.write_all(b"$-1\r\n")
                         } else {
                             let response = format!("${}\r\n{}\r\n", value.len(), value);
-                            stream.write_all(response.as_bytes()).unwrap();
+                            stream.write_all(response.as_bytes())
                         }
                     } else {
-                        stream.write_all(b"$-1\r\n").unwrap();
+                        stream.write_all(b"$-1\r\n")
                     }
                 }
+            };
+
+            if result.is_err() {
+                break;
             }
         }
     }
@@ -85,98 +94,385 @@ enum Command {
     Get(String),
 }
 
-fn parse_commands(request: &str) -> Vec<Command> {
-    let mut commands = Vec::new();
-    let lines: Vec<&str> = request.split("\r\n").collect();
-    let mut i = 0;
+struct Parser<'a> {
+    lines: Vec<&'a str>,
+    index: usize,
+}
 
-    while i < lines.len() {
-        if lines[i].starts_with('*') {
-            // Array indicator
-            i += 1;
-            if i < lines.len() && lines[i].starts_with('$') {
-                i += 1;
-                if i < lines.len() {
-                    let cmd = lines[i].to_uppercase();
-                    i += 1;
+impl<'a> Parser<'a> {
+    fn new(request: &'a str) -> Self {
+        Parser {
+            lines: request.split("\r\n").collect(),
+            index: 0,
+        }
+    }
 
-                    match cmd.as_str() {
-                        "PING" => {
-                            commands.push(Command::Ping);
-                        }
-                        "ECHO" => {
-                            // Skip the length indicator
-                            if i < lines.len() && lines[i].starts_with('$') {
-                                i += 1;
-                                if i < lines.len() {
-                                    commands.push(Command::Echo(lines[i].to_string()));
-                                    i += 1;
-                                }
-                            }
-                        }
-                        "SET" => {
-                            // Skip the length indicator for key
-                            if i < lines.len() && lines[i].starts_with('$') {
-                                i += 1;
-                                if i < lines.len() {
-                                    let key = lines[i].to_string();
-                                    i += 1;
-                                    // Skip the length indicator for value
-                                    if i < lines.len() && lines[i].starts_with('$') {
-                                        i += 1;
-                                        if i < lines.len() {
-                                            let value = lines[i].to_string();
-                                            i += 1;
+    fn peek(&self) -> Option<&str> {
+        if self.index < self.lines.len() {
+            Some(self.lines[self.index])
+        } else {
+            None
+        }
+    }
 
-                                            // Check for PX (milliseconds) or EX (seconds) flag
-                                            let mut expiry_ms = None;
-                                            if i < lines.len() && lines[i].starts_with('$') {
-                                                i += 1;
-                                                if i < lines.len() {
-                                                    let flag = lines[i].to_uppercase();
-                                                    i += 1;
+    fn advance(&mut self) {
+        self.index += 1;
+    }
 
-                                                    if flag == "PX" || flag == "EX" {
-                                                        // Get the expiry value
-                                                        if i < lines.len() && lines[i].starts_with('$') {
-                                                            i += 1;
-                                                            if i < lines.len() {
-                                                                if let Ok(val) = lines[i].parse::<u64>() {
-                                                                    expiry_ms = Some(if flag == "EX" { val * 1000 } else { val });
-                                                                }
-                                                                i += 1;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            commands.push(Command::Set(key, value, expiry_ms));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "GET" => {
-                            // Skip the length indicator
-                            if i < lines.len() && lines[i].starts_with('$') {
-                                i += 1;
-                                if i < lines.len() {
-                                    commands.push(Command::Get(lines[i].to_string()));
-                                    i += 1;
-                                }
-                            }
-                        }
-                        _ => {
-                            i += 1;
-                        }
-                    }
+    fn read_bulk_string(&mut self) -> Option<String> {
+        // Expect a bulk string in format: $<length>\r\n<data>\r\n
+        if let Some(line) = self.peek() {
+            if line.starts_with('$') {
+                self.advance();
+                if self.index < self.lines.len() {
+                    let data = self.lines[self.index].to_string();
+                    self.advance();
+                    return Some(data);
                 }
             }
+        }
+        None
+    }
+
+    fn parse_command(&mut self) -> Option<Command> {
+        // Check for array indicator
+        if let Some(line) = self.peek() {
+            if !line.starts_with('*') {
+                self.advance();
+                return None;
+            }
+            self.advance();
         } else {
-            i += 1;
+            return None;
+        }
+
+        // Read command name
+        let cmd_name = self.read_bulk_string()?.to_uppercase();
+
+        match cmd_name.as_str() {
+            "PING" => Some(Command::Ping),
+            "ECHO" => {
+                let msg = self.read_bulk_string()?;
+                Some(Command::Echo(msg))
+            }
+            "SET" => {
+                let key = self.read_bulk_string()?;
+                let value = self.read_bulk_string()?;
+
+                // Check for optional PX or EX flag
+                let expiry_ms = if let Some(flag_str) = self.read_bulk_string() {
+                    let flag = flag_str.to_uppercase();
+                    if flag == "PX" || flag == "EX" {
+                        if let Some(val_str) = self.read_bulk_string() {
+                            if let Ok(val) = val_str.parse::<u64>() {
+                                Some(if flag == "EX" { val * 1000 } else { val })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                Some(Command::Set(key, value, expiry_ms))
+            }
+            "GET" => {
+                let key = self.read_bulk_string()?;
+                Some(Command::Get(key))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_commands(request: &str) -> Vec<Command> {
+    let mut parser = Parser::new(request);
+    let mut commands = Vec::new();
+
+    while parser.index < parser.lines.len() {
+        if let Some(command) = parser.parse_command() {
+            commands.push(command);
+        } else {
+            parser.advance();
         }
     }
 
     commands
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static PORT_COUNTER: AtomicU16 = AtomicU16::new(6380);
+
+    fn start_test_server() -> (thread::JoinHandle<()>, u16) {
+        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let handle = thread::spawn(move || {
+            let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+            let pool = ThreadPool::new(4);
+            let store = Arc::new(Mutex::new(HashMap::new()));
+
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let store_clone = Arc::clone(&store);
+                        pool.execute(move || {
+                            handle_connection(stream, store_clone);
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (handle, port)
+    }
+
+    fn send_command(port: u16, command: &str) -> String {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        stream.write_all(command.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Give server time to process
+        thread::sleep(Duration::from_millis(50));
+
+        let mut buf = [0; 512];
+        let bytes_read = stream.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..bytes_read]).to_string()
+    }
+
+    #[test]
+    fn test_ping_command() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100)); // Wait for server to start
+
+        let response = send_command(port, "*1\r\n$4\r\nPING\r\n");
+        assert_eq!(response, "+PONG\r\n");
+    }
+
+    #[test]
+    fn test_echo_command() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n");
+        assert_eq!(response, "$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_set_and_get_commands() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // SET command
+        let set_response = send_command(port, "*3\r\n$3\r\nSET\r\n$6\r\ntestkey\r\n$9\r\ntestvalue\r\n");
+        assert_eq!(set_response, "+OK\r\n");
+
+        // GET command
+        let get_response = send_command(port, "*2\r\n$3\r\nGET\r\n$6\r\ntestkey\r\n");
+        assert_eq!(get_response, "$9\r\ntestvalue\r\n");
+    }
+
+    #[test]
+    fn test_get_nonexistent_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$3\r\nGET\r\n$10\r\nnonexistent\r\n");
+        assert_eq!(response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_set_with_expiry() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // SET with PX (expires in 100ms)
+        let set_response = send_command(port, "*5\r\n$3\r\nSET\r\n$9\r\nexpirekey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$3\r\n100\r\n");
+        assert_eq!(set_response, "+OK\r\n");
+
+        // GET immediately - should exist
+        let get_response1 = send_command(port, "*2\r\n$3\r\nGET\r\n$9\r\nexpirekey\r\n");
+        assert_eq!(get_response1, "$5\r\nvalue\r\n");
+
+        // Wait for expiry
+        thread::sleep(Duration::from_millis(150));
+
+        // GET after expiry - should return null
+        let get_response2 = send_command(port, "*2\r\n$3\r\nGET\r\n$9\r\nexpirekey\r\n");
+        assert_eq!(get_response2, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_parse_ping() {
+        let request = "*1\r\n$4\r\nPING\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Ping));
+    }
+
+    #[test]
+    fn test_parse_ping_lowercase() {
+        let request = "*1\r\n$4\r\nping\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Ping));
+    }
+
+    #[test]
+    fn test_parse_echo() {
+        let request = "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Echo(msg) => assert_eq!(msg, "hello"),
+            _ => panic!("Expected Echo command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_echo_empty_string() {
+        let request = "*2\r\n$4\r\nECHO\r\n$0\r\n\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Echo(msg) => assert_eq!(msg, ""),
+            _ => panic!("Expected Echo command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_simple() {
+        let request = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Set(key, value, expiry) => {
+                assert_eq!(key, "key");
+                assert_eq!(value, "value");
+                assert_eq!(*expiry, None);
+            }
+            _ => panic!("Expected Set command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_with_px() {
+        let request = "*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nPX\r\n$4\r\n1000\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Set(key, value, expiry) => {
+                assert_eq!(key, "key");
+                assert_eq!(value, "value");
+                assert_eq!(*expiry, Some(1000));
+            }
+            _ => panic!("Expected Set command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_with_ex() {
+        let request = "*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\nEX\r\n$2\r\n10\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Set(key, value, expiry) => {
+                assert_eq!(key, "key");
+                assert_eq!(value, "value");
+                assert_eq!(*expiry, Some(10000)); // Converted to milliseconds
+            }
+            _ => panic!("Expected Set command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_set_with_px_lowercase() {
+        let request = "*5\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n$2\r\npx\r\n$3\r\n500\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Set(key, value, expiry) => {
+                assert_eq!(key, "key");
+                assert_eq!(value, "value");
+                assert_eq!(*expiry, Some(500));
+            }
+            _ => panic!("Expected Set command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_get() {
+        let request = "*2\r\n$3\r\nGET\r\n$6\r\nmykey1\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Get(key) => assert_eq!(key, "mykey1"),
+            _ => panic!("Expected Get command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_pings() {
+        let request = "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(commands[0], Command::Ping));
+        assert!(matches!(commands[1], Command::Ping));
+    }
+
+    #[test]
+    fn test_parse_mixed_commands() {
+        let request = "*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(commands[0], Command::Ping));
+        match &commands[1] {
+            Command::Echo(msg) => assert_eq!(msg, "hi"),
+            _ => panic!("Expected Echo command"),
+        }
+        match &commands[2] {
+            Command::Set(key, value, expiry) => {
+                assert_eq!(key, "a");
+                assert_eq!(value, "b");
+                assert_eq!(*expiry, None);
+            }
+            _ => panic!("Expected Set command"),
+        }
+        match &commands[3] {
+            Command::Get(key) => assert_eq!(key, "a"),
+            _ => panic!("Expected Get command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_request() {
+        let request = "";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_invalid_command() {
+        let request = "*1\r\n$7\r\nINVALID\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 0); // Should not parse unknown commands
+    }
+
+    #[test]
+    fn test_multiple_pings() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n");
+        assert_eq!(response, "+PONG\r\n+PONG\r\n");
+    }
 }
