@@ -2,6 +2,8 @@
 use std::{
     io::{BufReader, Write, prelude::*},
     net::{TcpListener, TcpStream},
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
 use threadpool::ThreadPool;
 
@@ -13,13 +15,15 @@ fn main() {
     //
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     let pool = ThreadPool::new(4);
+    let store = Arc::new(Mutex::new(HashMap::new()));
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 println!("accepted new connection");
-                pool.execute(|| {
-                    handle_connection(stream);
+                let store_clone = Arc::clone(&store);
+                pool.execute(move || {
+                    handle_connection(stream, store_clone);
                 });
             }
             Err(e) => {
@@ -29,7 +33,7 @@ fn main() {
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, String>>>) {
     let mut buf = [0; 512];
     loop {
         let bytes_read = stream.read(&mut buf).unwrap();
@@ -48,6 +52,20 @@ fn handle_connection(mut stream: TcpStream) {
                     let response = format!("${}\r\n{}\r\n", msg.len(), msg);
                     stream.write_all(response.as_bytes()).unwrap();
                 }
+                Command::Set(key, value) => {
+                    let mut store = store.lock().unwrap();
+                    store.insert(key, value);
+                    stream.write_all(b"+OK\r\n").unwrap();
+                }
+                Command::Get(key) => {
+                    let store = store.lock().unwrap();
+                    if let Some(value) = store.get(&key) {
+                        let response = format!("${}\r\n{}\r\n", value.len(), value);
+                        stream.write_all(response.as_bytes()).unwrap();
+                    } else {
+                        stream.write_all(b"$-1\r\n").unwrap();
+                    }
+                }
             }
         }
     }
@@ -56,6 +74,8 @@ fn handle_connection(mut stream: TcpStream) {
 enum Command {
     Ping,
     Echo(String),
+    Set(String, String),
+    Get(String),
 }
 
 fn parse_commands(request: &str) -> Vec<Command> {
@@ -83,6 +103,35 @@ fn parse_commands(request: &str) -> Vec<Command> {
                                 i += 1;
                                 if i < lines.len() {
                                     commands.push(Command::Echo(lines[i].to_string()));
+                                    i += 1;
+                                }
+                            }
+                        }
+                        "SET" => {
+                            // Skip the length indicator for key
+                            if i < lines.len() && lines[i].starts_with('$') {
+                                i += 1;
+                                if i < lines.len() {
+                                    let key = lines[i].to_string();
+                                    i += 1;
+                                    // Skip the length indicator for value
+                                    if i < lines.len() && lines[i].starts_with('$') {
+                                        i += 1;
+                                        if i < lines.len() {
+                                            let value = lines[i].to_string();
+                                            commands.push(Command::Set(key, value));
+                                            i += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "GET" => {
+                            // Skip the length indicator
+                            if i < lines.len() && lines[i].starts_with('$') {
+                                i += 1;
+                                if i < lines.len() {
+                                    commands.push(Command::Get(lines[i].to_string()));
                                     i += 1;
                                 }
                             }
