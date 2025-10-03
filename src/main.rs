@@ -91,6 +91,24 @@ impl Store {
         }
     }
 
+    fn lpush(&mut self, key: String, values: Vec<String>) -> usize {
+        let list = self.data
+            .entry(key)
+            .or_insert_with(|| Value::List(Vec::new()));
+
+        match list {
+            Value::List(l) => {
+                // Insert each element at the beginning
+                // This reverses the order: LPUSH list a b c → [c, b, a]
+                for value in values {
+                    l.insert(0, value);
+                }
+                l.len()
+            }
+            _ => 0, // Key exists but is not a list
+        }
+    }
+
     fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<String>> {
         match self.data.get(key) {
             Some(Value::List(list)) => {
@@ -172,6 +190,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     let response = format!(":{}\r\n", len);
                     stream.write_all(response.as_bytes())
                 }
+                Command::LPush(key, values) => {
+                    let mut store = store.lock().unwrap();
+                    let len = store.lpush(key, values);
+                    let response = format!(":{}\r\n", len);
+                    stream.write_all(response.as_bytes())
+                }
                 Command::LRange(key, start, stop) => {
                     let store = store.lock().unwrap();
                     if let Some(values) = store.lrange(&key, start, stop) {
@@ -201,6 +225,7 @@ enum Command {
     Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
     RPush(String, Vec<String>), // key, values
+    LPush(String, Vec<String>), // key, values
     LRange(String, i64, i64), // key, start, stop
 }
 
@@ -308,6 +333,21 @@ impl<'a> Parser<'a> {
                     None
                 } else {
                     Some(Command::RPush(key, values))
+                }
+            }
+            "LPUSH" => {
+                let key = self.read_bulk_string()?;
+                let mut values = Vec::new();
+
+                // Read all remaining values
+                while let Some(value) = self.read_bulk_string() {
+                    values.push(value);
+                }
+
+                if values.is_empty() {
+                    None
+                } else {
+                    Some(Command::LPush(key, values))
                 }
             }
             "LRANGE" => {
@@ -755,5 +795,101 @@ mod tests {
         // Request range where start > stop
         let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n5\r\n$1\r\n2\r\n");
         assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_parse_lpush_single_value() {
+        let request = "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LPush(key, values) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0], "value");
+            }
+            _ => panic!("Expected LPush command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lpush_multiple_values() {
+        let request = "*5\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LPush(key, values) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(values.len(), 3);
+                assert_eq!(values[0], "v1");
+                assert_eq!(values[1], "v2");
+                assert_eq!(values[2], "v3");
+            }
+            _ => panic!("Expected LPush command"),
+        }
+    }
+
+    #[test]
+    fn test_lpush_new_list() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n");
+        assert_eq!(response, ":1\r\n");
+
+        // Verify it was inserted at the beginning
+        let lrange_response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(lrange_response, "*1\r\n$5\r\nvalue\r\n");
+    }
+
+    #[test]
+    fn test_lpush_multiple_values() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // First push: LPUSH mylist v1 v2
+        // v1 is inserted first at position 0: [v1]
+        // v2 is inserted next at position 0: [v2, v1]
+        let response1 = send_command(port, "*4\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+        assert_eq!(response1, ":2\r\n");
+
+        // Second push: LPUSH mylist v3
+        // v3 is inserted at position 0: [v3, v2, v1]
+        let response2 = send_command(port, "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$2\r\nv3\r\n");
+        assert_eq!(response2, ":3\r\n");
+
+        // Verify order: v3, v2, v1
+        let lrange_response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(lrange_response, "*3\r\n$2\r\nv3\r\n$2\r\nv2\r\n$2\r\nv1\r\n");
+    }
+
+    #[test]
+    fn test_lpush_prepends_to_existing() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create list with RPUSH
+        send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n");
+
+        // Prepend with LPUSH
+        send_command(port, "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\nc\r\n");
+
+        // Verify order: c, a, b
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(response, "*3\r\n$1\r\nc\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn test_lpush_reverses_order() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Push multiple values at once - they should be reversed
+        // LPUSH inserts one by one at the front, so last arg ends up first
+        send_command(port, "*5\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n");
+
+        // Should be: 3, 2, 1 (reversed because each is inserted at position 0)
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+        assert_eq!(response, "*3\r\n$1\r\n3\r\n$1\r\n2\r\n$1\r\n1\r\n");
     }
 }
