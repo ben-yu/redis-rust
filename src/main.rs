@@ -90,6 +90,41 @@ impl Store {
             _ => 0, // Key exists but is not a list
         }
     }
+
+    fn lrange(&self, key: &str, start: i64, stop: i64) -> Option<Vec<String>> {
+        match self.data.get(key) {
+            Some(Value::List(list)) => {
+                let len = list.len() as i64;
+                if len == 0 {
+                    return Some(Vec::new());
+                }
+
+                // Handle negative indices
+                let start_idx = if start < 0 {
+                    (len + start).max(0)
+                } else {
+                    start
+                };
+
+                let stop_idx = if stop < 0 {
+                    (len + stop).max(0)
+                } else {
+                    stop
+                };
+
+                // If start is beyond list length or start > stop, return empty array
+                if start_idx >= len || start_idx > stop_idx {
+                    return Some(Vec::new());
+                }
+
+                // Clamp stop to valid range
+                let stop_idx = stop_idx.min(len - 1);
+
+                Some(list[start_idx as usize..=stop_idx as usize].to_vec())
+            }
+            _ => None, // Key doesn't exist or is not a list
+        }
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
@@ -137,6 +172,20 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     let response = format!(":{}\r\n", len);
                     stream.write_all(response.as_bytes())
                 }
+                Command::LRange(key, start, stop) => {
+                    let store = store.lock().unwrap();
+                    if let Some(values) = store.lrange(&key, start, stop) {
+                        // Array response: *<count>\r\n followed by bulk strings
+                        let mut response = format!("*{}\r\n", values.len());
+                        for value in values {
+                            response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                        }
+                        stream.write_all(response.as_bytes())
+                    } else {
+                        // Key doesn't exist or is not a list
+                        stream.write_all(b"*0\r\n")
+                    }
+                }
             };
 
             if result.is_err() {
@@ -152,6 +201,7 @@ enum Command {
     Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
     RPush(String, Vec<String>), // key, values
+    LRange(String, i64, i64), // key, start, stop
 }
 
 struct Parser<'a> {
@@ -259,6 +309,16 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(Command::RPush(key, values))
                 }
+            }
+            "LRANGE" => {
+                let key = self.read_bulk_string()?;
+                let start_str = self.read_bulk_string()?;
+                let stop_str = self.read_bulk_string()?;
+
+                let start = start_str.parse::<i64>().ok()?;
+                let stop = stop_str.parse::<i64>().ok()?;
+
+                Some(Command::LRange(key, start, stop))
             }
             _ => None,
         }
@@ -604,5 +664,96 @@ mod tests {
         // Second push
         let response2 = send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv3\r\n");
         assert_eq!(response2, ":3\r\n");
+    }
+
+    #[test]
+    fn test_parse_lrange() {
+        let request = "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$1\r\n2\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LRange(key, start, stop) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(*start, 0);
+                assert_eq!(*stop, 2);
+            }
+            _ => panic!("Expected LRange command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lrange_negative_indices() {
+        let request = "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$2\r\n-3\r\n$2\r\n-1\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LRange(key, start, stop) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(*start, -3);
+                assert_eq!(*stop, -1);
+            }
+            _ => panic!("Expected LRange command"),
+        }
+    }
+
+    #[test]
+    fn test_lrange_basic() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 3 elements
+        send_command(port, "*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n");
+
+        // Get all elements
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$1\r\n2\r\n");
+        assert_eq!(response, "*3\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n");
+    }
+
+    #[test]
+    fn test_lrange_partial() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 5 elements
+        send_command(port, "*7\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n$2\r\nv4\r\n$2\r\nv5\r\n");
+
+        // Get elements 1-3
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n1\r\n$1\r\n3\r\n");
+        assert_eq!(response, "*3\r\n$2\r\nv2\r\n$2\r\nv3\r\n$2\r\nv4\r\n");
+    }
+
+    #[test]
+    fn test_lrange_negative_indices() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 5 elements
+        send_command(port, "*7\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n$2\r\nv4\r\n$2\r\nv5\r\n");
+
+        // Get last 3 elements using negative indices
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$2\r\n-3\r\n$2\r\n-1\r\n");
+        assert_eq!(response, "*3\r\n$2\r\nv3\r\n$2\r\nv4\r\n$2\r\nv5\r\n");
+    }
+
+    #[test]
+    fn test_lrange_nonexistent_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$10\r\nnonexistent\r\n$1\r\n0\r\n$1\r\n5\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_lrange_empty_range() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list
+        send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+
+        // Request range where start > stop
+        let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n5\r\n$1\r\n2\r\n");
+        assert_eq!(response, "*0\r\n");
     }
 }
