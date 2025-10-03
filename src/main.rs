@@ -16,7 +16,7 @@ fn main() {
     //
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
     let pool = ThreadPool::new(4);
-    let store = Arc::new(Mutex::new(HashMap::new()));
+    let store = Arc::new(Mutex::new(Store::new()));
 
     for stream in listener.incoming() {
         match stream {
@@ -34,7 +34,65 @@ fn main() {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, (String, Option<Instant>)>>>) {
+enum Value {
+    String(String, Option<Instant>), // value, optional expiry
+    List(Vec<String>),
+}
+
+struct Store {
+    data: HashMap<String, Value>,
+}
+
+impl Store {
+    fn new() -> Self {
+        Store {
+            data: HashMap::new(),
+        }
+    }
+
+    fn set(&mut self, key: String, value: String, expiry: Option<Instant>) {
+        self.data.insert(key, Value::String(value, expiry));
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        match self.data.get(key) {
+            Some(Value::String(val, expiry)) => {
+                if expiry.map_or(false, |exp| Instant::now() > exp) {
+                    None // Expired
+                } else {
+                    Some(val.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn remove_if_expired(&mut self, key: &str) -> bool {
+        if let Some(Value::String(_, expiry)) = self.data.get(key) {
+            if expiry.map_or(false, |exp| Instant::now() > exp) {
+                self.data.remove(key);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn rpush(&mut self, key: String, values: Vec<String>) -> usize {
+        let list = self.data
+            .entry(key)
+            .or_insert_with(|| Value::List(Vec::new()));
+
+        match list {
+            Value::List(l) => {
+                l.extend(values);
+                l.len()
+            }
+            _ => 0, // Key exists but is not a list
+        }
+    }
+}
+
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
     let mut buf = [0; 512];
     loop {
         let bytes_read = match stream.read(&mut buf) {
@@ -59,24 +117,25 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<HashMap<String, (St
                 Command::Set(key, value, expiry_ms) => {
                     let mut store = store.lock().unwrap();
                     let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-                    store.insert(key, (value, expiry));
+                    store.set(key, value, expiry);
                     stream.write_all(b"+OK\r\n")
                 }
                 Command::Get(key) => {
                     let mut store = store.lock().unwrap();
-                    if let Some((value, expiry)) = store.get(&key) {
-                        // Check if key has expired
-                        if expiry.map_or(false, |exp| Instant::now() > exp) {
-                            // Key expired, remove it
-                            store.remove(&key);
-                            stream.write_all(b"$-1\r\n")
-                        } else {
-                            let response = format!("${}\r\n{}\r\n", value.len(), value);
-                            stream.write_all(response.as_bytes())
-                        }
+                    if store.remove_if_expired(&key) {
+                        stream.write_all(b"$-1\r\n")
+                    } else if let Some(value) = store.get(&key) {
+                        let response = format!("${}\r\n{}\r\n", value.len(), value);
+                        stream.write_all(response.as_bytes())
                     } else {
                         stream.write_all(b"$-1\r\n")
                     }
+                }
+                Command::RPush(key, values) => {
+                    let mut store = store.lock().unwrap();
+                    let len = store.rpush(key, values);
+                    let response = format!(":{}\r\n", len);
+                    stream.write_all(response.as_bytes())
                 }
             };
 
@@ -92,6 +151,7 @@ enum Command {
     Echo(String),
     Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
+    RPush(String, Vec<String>), // key, values
 }
 
 struct Parser<'a> {
@@ -185,6 +245,21 @@ impl<'a> Parser<'a> {
                 let key = self.read_bulk_string()?;
                 Some(Command::Get(key))
             }
+            "RPUSH" => {
+                let key = self.read_bulk_string()?;
+                let mut values = Vec::new();
+
+                // Read all remaining values
+                while let Some(value) = self.read_bulk_string() {
+                    values.push(value);
+                }
+
+                if values.is_empty() {
+                    None
+                } else {
+                    Some(Command::RPush(key, values))
+                }
+            }
             _ => None,
         }
     }
@@ -219,7 +294,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
             let pool = ThreadPool::new(4);
-            let store = Arc::new(Mutex::new(HashMap::new()));
+            let store = Arc::new(Mutex::new(Store::new()));
 
             for stream in listener.incoming() {
                 match stream {
@@ -474,5 +549,60 @@ mod tests {
 
         let response = send_command(port, "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n");
         assert_eq!(response, "+PONG\r\n+PONG\r\n");
+    }
+
+    #[test]
+    fn test_parse_rpush_single_value() {
+        let request = "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::RPush(key, values) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0], "value");
+            }
+            _ => panic!("Expected RPush command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rpush_multiple_values() {
+        let request = "*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::RPush(key, values) => {
+                assert_eq!(key, "mylist");
+                assert_eq!(values.len(), 3);
+                assert_eq!(values[0], "v1");
+                assert_eq!(values[1], "v2");
+                assert_eq!(values[2], "v3");
+            }
+            _ => panic!("Expected RPush command"),
+        }
+    }
+
+    #[test]
+    fn test_rpush_new_list() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n");
+        assert_eq!(response, ":1\r\n");
+    }
+
+    #[test]
+    fn test_rpush_multiple_values() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // First push
+        let response1 = send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+        assert_eq!(response1, ":2\r\n");
+
+        // Second push
+        let response2 = send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv3\r\n");
+        assert_eq!(response2, ":3\r\n");
     }
 }
