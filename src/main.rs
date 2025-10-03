@@ -143,6 +143,13 @@ impl Store {
             _ => None, // Key doesn't exist or is not a list
         }
     }
+
+    fn llen(&self, key: &str) -> usize {
+        match self.data.get(key) {
+            Some(Value::List(list)) => list.len(),
+            _ => 0, // Key doesn't exist or is not a list
+        }
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
@@ -210,6 +217,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         stream.write_all(b"*0\r\n")
                     }
                 }
+                Command::LLen(key) => {
+                    let store = store.lock().unwrap();
+                    let len = store.llen(&key);
+                    let response = format!(":{}\r\n", len);
+                    stream.write_all(response.as_bytes())
+                }
             };
 
             if result.is_err() {
@@ -227,6 +240,7 @@ enum Command {
     RPush(String, Vec<String>), // key, values
     LPush(String, Vec<String>), // key, values
     LRange(String, i64, i64), // key, start, stop
+    LLen(String), // key
 }
 
 struct Parser<'a> {
@@ -359,6 +373,10 @@ impl<'a> Parser<'a> {
                 let stop = stop_str.parse::<i64>().ok()?;
 
                 Some(Command::LRange(key, start, stop))
+            }
+            "LLEN" => {
+                let key = self.read_bulk_string()?;
+                Some(Command::LLen(key))
             }
             _ => None,
         }
@@ -891,5 +909,85 @@ mod tests {
         // Should be: 3, 2, 1 (reversed because each is inserted at position 0)
         let response = send_command(port, "*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n");
         assert_eq!(response, "*3\r\n$1\r\n3\r\n$1\r\n2\r\n$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn test_parse_llen() {
+        let request = "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::LLen(key) => {
+                assert_eq!(key, "mylist");
+            }
+            _ => panic!("Expected LLen command"),
+        }
+    }
+
+    #[test]
+    fn test_llen_existing_list() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list with 3 elements
+        send_command(port, "*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n");
+
+        // Get length
+        let response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(response, ":3\r\n");
+    }
+
+    #[test]
+    fn test_llen_nonexistent_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$10\r\nnonexistent\r\n");
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_llen_empty_list() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create an empty list (shouldn't actually be stored, but test anyway)
+        // Get length of non-existent list
+        let response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$9\r\nemptylist\r\n");
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_llen_after_operations() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // RPUSH 2 elements
+        send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n");
+        let response1 = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(response1, ":2\r\n");
+
+        // LPUSH 1 element
+        send_command(port, "*3\r\n$5\r\nLPUSH\r\n$6\r\nmylist\r\n$1\r\nc\r\n");
+        let response2 = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(response2, ":3\r\n");
+
+        // RPUSH 2 more elements
+        send_command(port, "*4\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\nd\r\n$1\r\ne\r\n");
+        let response3 = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n");
+        assert_eq!(response3, ":5\r\n");
+    }
+
+    #[test]
+    fn test_llen_wrong_type() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Set a string value
+        send_command(port, "*3\r\n$3\r\nSET\r\n$6\r\nmykey1\r\n$5\r\nvalue\r\n");
+
+        // Try to get length - should return 0 since it's not a list
+        let response = send_command(port, "*2\r\n$4\r\nLLEN\r\n$6\r\nmykey1\r\n");
+        assert_eq!(response, ":0\r\n");
     }
 }
