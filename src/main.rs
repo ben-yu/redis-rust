@@ -37,12 +37,66 @@ fn handle_connection(mut stream: TcpStream) {
 
         println!("Request: {}", request);
 
-        // Count PING commands in the request
-        let ping_count = request.matches("*1\r\n$4\r\nPING\r\n").count();
+        let commands = parse_commands(&request);
 
-        // Send the same number of PONGs back
-        for _ in 0..ping_count {
-            stream.write_all(b"+PONG\r\n").unwrap();
+        for command in commands {
+            match command {
+                Command::Ping => {
+                    stream.write_all(b"+PONG\r\n").unwrap();
+                }
+                Command::Echo(msg) => {
+                    let response = format!("${}\r\n{}\r\n", msg.len(), msg);
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
         }
     }
+}
+
+enum Command {
+    Ping,
+    Echo(String),
+}
+
+fn parse_commands(request: &str) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let lines: Vec<&str> = request.split("\r\n").collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with('*') {
+            // Array indicator
+            i += 1;
+            if i < lines.len() && lines[i].starts_with('$') {
+                i += 1;
+                if i < lines.len() {
+                    let cmd = lines[i].to_uppercase();
+                    i += 1;
+
+                    match cmd.as_str() {
+                        "PING" => {
+                            commands.push(Command::Ping);
+                        }
+                        "ECHO" => {
+                            // Skip the length indicator
+                            if i < lines.len() && lines[i].starts_with('$') {
+                                i += 1;
+                                if i < lines.len() {
+                                    commands.push(Command::Echo(lines[i].to_string()));
+                                    i += 1;
+                                }
+                            }
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    commands
 }
