@@ -287,10 +287,10 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                 }
                 Command::BLPop(keys, timeout_secs) => {
                     // If timeout is 0, wait indefinitely
-                    let deadline = if timeout_secs == 0 {
+                    let deadline = if timeout_secs == 0.0 {
                         None
                     } else {
-                        Some(Instant::now() + Duration::from_secs(timeout_secs))
+                        Some(Instant::now() + Duration::from_secs_f64(timeout_secs))
                     };
 
                     loop {
@@ -337,7 +337,7 @@ enum Command {
     LRange(String, i64, i64), // key, start, stop
     LLen(String), // key
     LPop(String, Option<usize>), // key, optional count
-    BLPop(Vec<String>, u64), // keys, timeout in seconds
+    BLPop(Vec<String>, f64), // keys, timeout in seconds
 }
 
 struct Parser<'a> {
@@ -499,7 +499,7 @@ impl<'a> Parser<'a> {
 
                 // Last arg is the timeout
                 let timeout_str = args.pop()?;
-                let timeout = timeout_str.parse::<u64>().ok()?;
+                let timeout = timeout_str.parse::<f64>().ok()?;
 
                 // Rest are keys
                 let keys = args;
