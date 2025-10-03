@@ -1248,7 +1248,7 @@ mod tests {
             Command::BLPop(keys, timeout) => {
                 assert_eq!(keys.len(), 1);
                 assert_eq!(keys[0], "mylist");
-                assert_eq!(*timeout, 5);
+                assert_eq!(*timeout, 5.0);
             }
             _ => panic!("Expected BLPop command"),
         }
