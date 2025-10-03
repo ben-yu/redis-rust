@@ -3,6 +3,7 @@ use std::{
     io::{BufReader, Write, prelude::*},
     net::{TcpListener, TcpStream},
 };
+use threadpool::ThreadPool;
 
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -11,11 +12,15 @@ fn main() {
     // Uncomment this block to pass the first stage
     //
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let pool = ThreadPool::new(4);
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 println!("accepted new connection");
-                handle_connection(stream);
+                pool.execute(|| {
+                    handle_connection(stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
