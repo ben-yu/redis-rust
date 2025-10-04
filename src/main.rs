@@ -147,6 +147,20 @@ impl Store {
         }
     }
 
+    fn get_type(&self, key: &str) -> &str {
+        match self.data.get(key) {
+            Some(Value::String(_, expiry)) => {
+                if expiry.map_or(false, |exp| Instant::now() > exp) {
+                    "none" // Expired
+                } else {
+                    "string"
+                }
+            }
+            Some(Value::List(_)) => "list",
+            None => "none",
+        }
+    }
+
     fn lpop(&mut self, key: &str, count: Option<usize>) -> Option<Vec<String>> {
         match self.data.get_mut(key) {
             Some(Value::List(list)) => {
@@ -318,6 +332,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
+                Command::Type(key) => {
+                    let store = store.lock().unwrap();
+                    let type_str = store.get_type(&key);
+                    let response = format!("+{}\r\n", type_str);
+                    stream.write_all(response.as_bytes())
+                }
             };
 
             if result.is_err() {
@@ -338,6 +358,7 @@ enum Command {
     LLen(String), // key
     LPop(String, Option<usize>), // key, optional count
     BLPop(Vec<String>, f64), // keys, timeout in seconds
+    Type(String), // key
 }
 
 struct Parser<'a> {
@@ -505,6 +526,10 @@ impl<'a> Parser<'a> {
                 let keys = args;
 
                 Some(Command::BLPop(keys, timeout))
+            }
+            "TYPE" => {
+                let key = self.read_bulk_string()?;
+                Some(Command::Type(key))
             }
             _ => None,
         }
