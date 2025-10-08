@@ -2,7 +2,7 @@
 use std::{
     io::{BufReader, Write, prelude::*},
     net::{TcpListener, TcpStream},
-    collections::HashMap,
+    collections::{HashMap, BTreeMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
     thread,
@@ -33,6 +33,7 @@ fn main() {
 enum Value {
     String(String, Option<Instant>), // value, optional expiry
     List(Vec<String>),
+    Stream(BTreeMap<String, Vec<(String, String)>>), // stream_id -> [(field, value)]
 }
 
 struct Store {
@@ -157,7 +158,63 @@ impl Store {
                 }
             }
             Some(Value::List(_)) => "list",
+            Some(Value::Stream(_)) => "stream",
             None => "none",
+        }
+    }
+
+    fn xadd(&mut self, key: String, id: String, fields: Vec<(String, String)>) -> Result<String, String> {
+        // Get or create the stream
+        let stream = self.data
+            .entry(key)
+            .or_insert_with(|| Value::Stream(BTreeMap::new()));
+
+        match stream {
+            Value::Stream(btree) => {
+                // Handle auto-generated IDs
+                let final_id = if id == "*" {
+                    // Generate ID: milliseconds-sequence
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    format!("{}-0", now)
+                } else if id.ends_with("-*") {
+                    // Partial ID: milliseconds-*, generate sequence
+                    let millis = id.trim_end_matches("-*");
+                    // Find the highest sequence number for this millisecond
+                    let mut seq = 0;
+                    for existing_id in btree.keys() {
+                        if let Some((ms, s)) = existing_id.split_once('-') {
+                            if ms == millis {
+                                if let Ok(seq_num) = s.parse::<u64>() {
+                                    seq = seq.max(seq_num + 1);
+                                }
+                            }
+                        }
+                    }
+                    format!("{}-{}", millis, seq)
+                } else {
+                    id.clone()
+                };
+
+                // Validate ID is greater than existing IDs
+                if let Some(last_id) = btree.keys().last() {
+                    if !is_id_greater(&final_id, last_id) {
+                        return Err("ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string());
+                    }
+                }
+
+                // Validate ID is not 0-0
+                if final_id == "0-0" {
+                    return Err("ERR The ID specified in XADD must be greater than 0-0".to_string());
+                }
+
+                // Add the entry
+                btree.insert(final_id.clone(), fields);
+                Ok(final_id)
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
         }
     }
 
@@ -204,6 +261,30 @@ impl Store {
             }
         }
         None
+    }
+}
+
+fn is_id_greater(id1: &str, id2: &str) -> bool {
+    // Compare two stream IDs in format "milliseconds-sequence"
+    let parse_id = |id: &str| -> Option<(u64, u64)> {
+        let parts: Vec<&str> = id.split('-').collect();
+        if parts.len() == 2 {
+            let ms = parts[0].parse::<u64>().ok()?;
+            let seq = parts[1].parse::<u64>().ok()?;
+            Some((ms, seq))
+        } else {
+            None
+        }
+    };
+
+    if let (Some((ms1, seq1)), Some((ms2, seq2))) = (parse_id(id1), parse_id(id2)) {
+        if ms1 != ms2 {
+            ms1 > ms2
+        } else {
+            seq1 > seq2
+        }
+    } else {
+        false
     }
 }
 
@@ -338,6 +419,19 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     let response = format!("+{}\r\n", type_str);
                     stream.write_all(response.as_bytes())
                 }
+                Command::XAdd(key, id, fields) => {
+                    let mut store = store.lock().unwrap();
+                    match store.xadd(key, id, fields) {
+                        Ok(entry_id) => {
+                            let response = format!("${}\r\n{}\r\n", entry_id.len(), entry_id);
+                            stream.write_all(response.as_bytes())
+                        }
+                        Err(err_msg) => {
+                            let response = format!("-{}\r\n", err_msg);
+                            stream.write_all(response.as_bytes())
+                        }
+                    }
+                }
             };
 
             if result.is_err() {
@@ -359,6 +453,7 @@ enum Command {
     LPop(String, Option<usize>), // key, optional count
     BLPop(Vec<String>, f64), // keys, timeout in seconds
     Type(String), // key
+    XAdd(String, String, Vec<(String, String)>), // key, id, fields
 }
 
 struct Parser<'a> {
@@ -530,6 +625,26 @@ impl<'a> Parser<'a> {
             "TYPE" => {
                 let key = self.read_bulk_string()?;
                 Some(Command::Type(key))
+            }
+            "XADD" => {
+                let key = self.read_bulk_string()?;
+                let id = self.read_bulk_string()?;
+
+                // Read field-value pairs
+                let mut fields = Vec::new();
+                while let Some(field) = self.read_bulk_string() {
+                    if let Some(value) = self.read_bulk_string() {
+                        fields.push((field, value));
+                    } else {
+                        return None; // Odd number of field-value arguments
+                    }
+                }
+
+                if fields.is_empty() {
+                    None
+                } else {
+                    Some(Command::XAdd(key, id, fields))
+                }
             }
             _ => None,
         }
@@ -1304,5 +1419,144 @@ mod tests {
 
         assert_eq!(response, "*-1\r\n"); // Null response
         assert!(elapsed >= Duration::from_secs(1)); // Should have waited at least 1 second
+    }
+
+    #[test]
+    fn test_parse_xadd() {
+        let request = "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$1\r\n*\r\n$5\r\nfield\r\n$5\r\nvalue\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::XAdd(key, id, fields) => {
+                assert_eq!(key, "mystream");
+                assert_eq!(id, "*");
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0, "field");
+                assert_eq!(fields[0].1, "value");
+            }
+            _ => panic!("Expected XAdd command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_xadd_multiple_fields() {
+        let request = "*7\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-0\r\n$6\r\nfield1\r\n$6\r\nvalue1\r\n$6\r\nfield2\r\n$6\r\nvalue2\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::XAdd(key, id, fields) => {
+                assert_eq!(key, "mystream");
+                assert_eq!(id, "1526919030474-0");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0], ("field1".to_string(), "value1".to_string()));
+                assert_eq!(fields[1], ("field2".to_string(), "value2".to_string()));
+            }
+            _ => panic!("Expected XAdd command"),
+        }
+    }
+
+    #[test]
+    fn test_xadd_with_explicit_id() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entry with explicit ID
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-0\r\n$11\r\ntemperature\r\n$2\r\n36\r\n");
+        assert_eq!(response, "$15\r\n1526919030474-0\r\n");
+
+        // Verify stream type
+        let type_response = send_command(port, "*2\r\n$4\r\nTYPE\r\n$8\r\nmystream\r\n");
+        assert_eq!(type_response, "+stream\r\n");
+    }
+
+    #[test]
+    fn test_xadd_with_auto_id() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entry with auto-generated ID
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$1\r\n*\r\n$11\r\ntemperature\r\n$2\r\n36\r\n");
+
+        // Should return a valid ID in format milliseconds-sequence
+        assert!(response.starts_with("$"));
+        assert!(response.contains("-"));
+    }
+
+    #[test]
+    fn test_xadd_multiple_fields() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entry with multiple field-value pairs
+        let response = send_command(port, "*7\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-0\r\n$11\r\ntemperature\r\n$2\r\n36\r\n$8\r\nhumidity\r\n$2\r\n95\r\n");
+        assert_eq!(response, "$15\r\n1526919030474-0\r\n");
+    }
+
+    #[test]
+    fn test_xadd_sequential_entries() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add first entry
+        let response1 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        assert_eq!(response1, "$15\r\n1526919030474-0\r\n");
+
+        // Add second entry with higher ID
+        let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-1\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        assert_eq!(response2, "$15\r\n1526919030474-1\r\n");
+    }
+
+    #[test]
+    fn test_xadd_id_must_be_greater() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add first entry
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-1\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // Try to add entry with same or lower ID - should fail
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$15\r\n1526919030474-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        assert!(response.starts_with("-ERR"));
+    }
+
+    #[test]
+    fn test_xadd_zero_id_not_allowed() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Try to add entry with 0-0 ID - should fail
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$3\r\n0-0\r\n$5\r\nfield\r\n$5\r\nvalue\r\n");
+        assert!(response.starts_with("-ERR"));
+    }
+
+    #[test]
+    fn test_xadd_creates_stream_automatically() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Verify stream doesn't exist
+        let type_response1 = send_command(port, "*2\r\n$4\r\nTYPE\r\n$9\r\nnewstream\r\n");
+        assert_eq!(type_response1, "+none\r\n");
+
+        // Add entry - should create stream automatically
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$9\r\nnewstream\r\n$15\r\n1526919030474-0\r\n$5\r\nfield\r\n$5\r\nvalue\r\n");
+        assert_eq!(response, "$15\r\n1526919030474-0\r\n");
+
+        // Verify stream now exists
+        let type_response2 = send_command(port, "*2\r\n$4\r\nTYPE\r\n$9\r\nnewstream\r\n");
+        assert_eq!(type_response2, "+stream\r\n");
+    }
+
+    #[test]
+    fn test_xadd_wrong_type() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a string key
+        send_command(port, "*3\r\n$3\r\nSET\r\n$6\r\nmykey1\r\n$5\r\nvalue\r\n");
+
+        // Try to use XADD on string key - should fail
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$6\r\nmykey1\r\n$15\r\n1526919030474-0\r\n$5\r\nfield\r\n$5\r\nvalue\r\n");
+        assert!(response.starts_with("-"));
     }
 }
