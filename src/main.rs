@@ -178,21 +178,50 @@ impl Store {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis();
-                    format!("{}-0", now)
-                } else if id.ends_with("-*") {
-                    // Partial ID: milliseconds-*, generate sequence
-                    let millis = id.trim_end_matches("-*");
+
+                    let now_str = now.to_string();
                     // Find the highest sequence number for this millisecond
-                    let mut seq = 0;
+                    let mut max_seq: Option<u64> = None;
                     for existing_id in btree.keys() {
                         if let Some((ms, s)) = existing_id.split_once('-') {
-                            if ms == millis {
+                            if ms == now_str {
                                 if let Ok(seq_num) = s.parse::<u64>() {
-                                    seq = seq.max(seq_num + 1);
+                                    max_seq = Some(max_seq.map_or(seq_num, |current| current.max(seq_num)));
                                 }
                             }
                         }
                     }
+
+                    // If entries exist with this millisecond, increment the max sequence
+                    // Otherwise start at 0
+                    let seq = max_seq.map_or(0, |s| s + 1);
+                    format!("{}-{}", now, seq)
+                } else if id.ends_with("-*") {
+                    // Partial ID: milliseconds-*, generate sequence
+                    let millis = id.trim_end_matches("-*");
+
+                    // Find the highest sequence number for this millisecond
+                    let mut max_seq: Option<u64> = None;
+                    for existing_id in btree.keys() {
+                        if let Some((ms, s)) = existing_id.split_once('-') {
+                            if ms == millis {
+                                if let Ok(seq_num) = s.parse::<u64>() {
+                                    max_seq = Some(max_seq.map_or(seq_num, |current| current.max(seq_num)));
+                                }
+                            }
+                        }
+                    }
+
+                    // If entries exist with this millisecond, increment the max sequence
+                    // Otherwise: if time part is 0, start at 1; else start at 0
+                    let seq = if let Some(max) = max_seq {
+                        max + 1
+                    } else if millis == "0" {
+                        1
+                    } else {
+                        0
+                    };
+
                     format!("{}-{}", millis, seq)
                 } else {
                     id.clone()
@@ -1558,5 +1587,127 @@ mod tests {
         // Try to use XADD on string key - should fail
         let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$6\r\nmykey1\r\n$15\r\n1526919030474-0\r\n$5\r\nfield\r\n$5\r\nvalue\r\n");
         assert!(response.starts_with("-"));
+    }
+
+    #[test]
+    fn test_xadd_partial_auto_id_starts_at_zero() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // First entry with partial auto ID should start at 0
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        assert_eq!(response, "$5\r\n100-0\r\n");
+    }
+
+    #[test]
+    fn test_xadd_partial_auto_id_increments() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add first entry with time part 100
+        let response1 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        assert_eq!(response1, "$5\r\n100-0\r\n");
+
+        // Add second entry with same time part - should increment to 1
+        let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        assert_eq!(response2, "$5\r\n100-1\r\n");
+
+        // Add third entry - should increment to 2
+        let response3 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+        assert_eq!(response3, "$5\r\n100-2\r\n");
+    }
+
+    #[test]
+    fn test_xadd_partial_auto_id_zero_starts_at_one() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // When time part is 0, first sequence should be 1, not 0
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$2\r\n0-*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        assert_eq!(response, "$3\r\n0-1\r\n");
+    }
+
+    #[test]
+    fn test_xadd_partial_auto_id_zero_increments() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // First entry with time part 0 should start at 1
+        let response1 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$2\r\n0-*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        assert_eq!(response1, "$3\r\n0-1\r\n");
+
+        // Second entry should increment to 2
+        let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$2\r\n0-*\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        assert_eq!(response2, "$3\r\n0-2\r\n");
+    }
+
+    #[test]
+    fn test_xadd_partial_auto_id_different_times() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries with time part 100
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Add entry with time part 200 - should start at 0 again
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n200-*\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+        assert_eq!(response, "$5\r\n200-0\r\n");
+    }
+
+    #[test]
+    fn test_xadd_full_auto_id_increments_same_millisecond() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add first entry with full auto ID
+        let response1 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$1\r\n*\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // Extract the ID from response1
+        let parts: Vec<&str> = response1.split("\r\n").collect();
+        let id1 = parts[1];
+
+        // Immediately add another entry - if same millisecond, sequence should increment
+        let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$1\r\n*\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        let parts2: Vec<&str> = response2.split("\r\n").collect();
+        let id2 = parts2[1];
+
+        // Parse both IDs
+        let id1_parts: Vec<&str> = id1.split('-').collect();
+        let id2_parts: Vec<&str> = id2.split('-').collect();
+
+        let ms1 = id1_parts[0];
+        let seq1 = id1_parts[1].parse::<u64>().unwrap();
+        let ms2 = id2_parts[0];
+        let seq2 = id2_parts[1].parse::<u64>().unwrap();
+
+        // If same millisecond, sequence should increment
+        if ms1 == ms2 {
+            assert_eq!(seq2, seq1 + 1);
+        } else {
+            // If different millisecond, second should be greater
+            assert!(ms2.parse::<u64>().unwrap() > ms1.parse::<u64>().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_xadd_mixed_explicit_and_auto_seq() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add explicit entry with sequence 5
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-5\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // Add auto-sequence entry - should use 6
+        let response = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        assert_eq!(response, "$5\r\n100-6\r\n");
+
+        // Add another explicit entry with sequence 10
+        send_command(port, "*6\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$6\r\n100-10\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+
+        // Add auto-sequence entry - should use 11
+        let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue4\r\n");
+        assert_eq!(response2, "$6\r\n100-11\r\n");
     }
 }
