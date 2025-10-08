@@ -163,6 +163,31 @@ impl Store {
         }
     }
 
+    fn xrange(&self, key: &str, start: &str, end: &str) -> Option<Vec<(String, Vec<(String, String)>)>> {
+        match self.data.get(key) {
+            Some(Value::Stream(btree)) => {
+                let mut results = Vec::new();
+
+                // Handle special start/end values
+                let start_inclusive = start == "-";
+                let end_inclusive = end == "+";
+
+                for (entry_id, fields) in btree.iter() {
+                    // Check if entry is within range
+                    let after_start = start_inclusive || entry_id.as_str() >= start;
+                    let before_end = end_inclusive || entry_id.as_str() <= end;
+
+                    if after_start && before_end {
+                        results.push((entry_id.clone(), fields.clone()));
+                    }
+                }
+
+                Some(results)
+            }
+            _ => None, // Key doesn't exist or is not a stream
+        }
+    }
+
     fn xadd(&mut self, key: String, id: String, fields: Vec<(String, String)>) -> Result<String, String> {
         // Get or create the stream
         let stream = self.data
@@ -461,6 +486,34 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         }
                     }
                 }
+                Command::XRange(key, start, end) => {
+                    let store = store.lock().unwrap();
+                    if let Some(entries) = store.xrange(&key, &start, &end) {
+                        // Format: *<count>\r\n
+                        // For each entry: *2\r\n$<id_len>\r\n<id>\r\n*<field_count*2>\r\n<field-value pairs>
+                        let mut response = format!("*{}\r\n", entries.len());
+
+                        for (entry_id, fields) in entries {
+                            // Each entry is an array of 2 elements: [id, [field, value, field, value, ...]]
+                            response.push_str("*2\r\n");
+
+                            // Entry ID
+                            response.push_str(&format!("${}\r\n{}\r\n", entry_id.len(), entry_id));
+
+                            // Fields array (flat list of field-value pairs)
+                            response.push_str(&format!("*{}\r\n", fields.len() * 2));
+                            for (field, value) in fields {
+                                response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                                response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                            }
+                        }
+
+                        stream.write_all(response.as_bytes())
+                    } else {
+                        // Key doesn't exist or is not a stream - return empty array
+                        stream.write_all(b"*0\r\n")
+                    }
+                }
             };
 
             if result.is_err() {
@@ -483,6 +536,7 @@ enum Command {
     BLPop(Vec<String>, f64), // keys, timeout in seconds
     Type(String), // key
     XAdd(String, String, Vec<(String, String)>), // key, id, fields
+    XRange(String, String, String), // key, start, end
 }
 
 struct Parser<'a> {
@@ -674,6 +728,12 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(Command::XAdd(key, id, fields))
                 }
+            }
+            "XRANGE" => {
+                let key = self.read_bulk_string()?;
+                let start = self.read_bulk_string()?;
+                let end = self.read_bulk_string()?;
+                Some(Command::XRange(key, start, end))
             }
             _ => None,
         }
@@ -1709,5 +1769,138 @@ mod tests {
         // Add auto-sequence entry - should use 11
         let response2 = send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$4\r\n100-*\r\n$5\r\nfield\r\n$6\r\nvalue4\r\n");
         assert_eq!(response2, "$6\r\n100-11\r\n");
+    }
+
+    #[test]
+    fn test_parse_xrange() {
+        let request = "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\n200-0\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::XRange(key, start, end) => {
+                assert_eq!(key, "mystream");
+                assert_eq!(start, "100-0");
+                assert_eq!(end, "200-0");
+            }
+            _ => panic!("Expected XRange command"),
+        }
+    }
+
+    #[test]
+    fn test_xrange_basic() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+
+        // Get range from 100-0 to 200-0
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\n200-0\r\n");
+
+        // Should return 2 entries
+        assert!(response.starts_with("*2\r\n"));
+        assert!(response.contains("100-0"));
+        assert!(response.contains("200-0"));
+        assert!(response.contains("value1"));
+        assert!(response.contains("value2"));
+        assert!(!response.contains("value3"));
+    }
+
+    #[test]
+    fn test_xrange_inclusive() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Range is inclusive - exact match on both ends should be included
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\n200-0\r\n");
+        assert!(response.contains("100-0"));
+        assert!(response.contains("200-0"));
+    }
+
+    #[test]
+    fn test_xrange_minus_plus() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+
+        // Use - for start (minimum) and + for end (maximum)
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$1\r\n-\r\n$1\r\n+\r\n");
+
+        // Should return all entries
+        assert!(response.starts_with("*3\r\n"));
+        assert!(response.contains("100-0"));
+        assert!(response.contains("200-0"));
+        assert!(response.contains("300-0"));
+    }
+
+    #[test]
+    fn test_xrange_empty_stream() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Query non-existent stream
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$1\r\n-\r\n$1\r\n+\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xrange_no_matches() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Query range that doesn't match any entries
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$5\r\n500-0\r\n$5\r\n600-0\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xrange_multiple_fields() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entry with multiple fields
+        send_command(port, "*7\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$11\r\ntemperature\r\n$2\r\n36\r\n$8\r\nhumidity\r\n$2\r\n95\r\n");
+
+        // Get the entry
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$1\r\n-\r\n$1\r\n+\r\n");
+
+        // Should contain both fields
+        assert!(response.contains("100-0"));
+        assert!(response.contains("temperature"));
+        assert!(response.contains("36"));
+        assert!(response.contains("humidity"));
+        assert!(response.contains("95"));
+    }
+
+    #[test]
+    fn test_xrange_partial_range() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+
+        // Get from start to 200-0
+        let response = send_command(port, "*4\r\n$6\r\nXRANGE\r\n$8\r\nmystream\r\n$1\r\n-\r\n$5\r\n200-0\r\n");
+        assert!(response.starts_with("*2\r\n"));
+        assert!(response.contains("100-0"));
+        assert!(response.contains("200-0"));
+        assert!(!response.contains("300-0"));
     }
 }
