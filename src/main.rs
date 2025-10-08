@@ -198,16 +198,16 @@ impl Store {
                     id.clone()
                 };
 
+                // Validate ID is not 0-0
+                if final_id == "0-0" {
+                    return Err("ERR The ID specified in XADD must be greater than 0-0".to_string());
+                }
+
                 // Validate ID is greater than existing IDs
                 if let Some(last_id) = btree.keys().last() {
                     if !is_id_greater(&final_id, last_id) {
                         return Err("ERR The ID specified in XADD is equal or smaller than the target stream top item".to_string());
                     }
-                }
-
-                // Validate ID is not 0-0
-                if final_id == "0-0" {
-                    return Err("ERR The ID specified in XADD must be greater than 0-0".to_string());
                 }
 
                 // Add the entry
