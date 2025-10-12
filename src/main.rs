@@ -197,11 +197,7 @@ impl Store {
 
                 for (entry_id, fields) in btree.iter() {
                     // For XREAD, we want entries AFTER the specified ID (exclusive)
-                    // unless the start_id is $, which means only new entries (none initially)
-                    if start_id == "$" {
-                        // $ means return entries added after this call, so initially return nothing
-                        continue;
-                    } else if entry_id.as_str() > start_id.as_str() {
+                    if entry_id.as_str() > start_id.as_str() {
                         entries.push((entry_id.clone(), fields.clone()));
                     }
                 }
@@ -214,6 +210,15 @@ impl Store {
         }
 
         results
+    }
+
+    fn get_max_stream_id(&self, key: &str) -> Option<String> {
+        match self.data.get(key) {
+            Some(Value::Stream(btree)) => {
+                btree.keys().last().map(|id| id.clone())
+            }
+            _ => None,
+        }
     }
 
     fn xadd(&mut self, key: String, id: String, fields: Vec<(String, String)>) -> Result<String, String> {
@@ -543,6 +548,20 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     }
                 }
                 Command::XRead(block_ms, streams) => {
+                    // Resolve $ to the current maximum ID for each stream
+                    let resolved_streams: Vec<(String, String)> = {
+                        let store = store.lock().unwrap();
+                        streams.iter().map(|(key, start_id)| {
+                            if start_id == "$" {
+                                // Replace $ with the maximum ID in the stream, or "0-0" if stream doesn't exist
+                                let max_id = store.get_max_stream_id(key).unwrap_or_else(|| "0-0".to_string());
+                                (key.clone(), max_id)
+                            } else {
+                                (key.clone(), start_id.clone())
+                            }
+                        }).collect()
+                    };
+
                     // Determine if we should block and for how long
                     let should_block = block_ms.is_some();
                     let deadline = block_ms.and_then(|ms| {
@@ -556,7 +575,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     loop {
                         let results = {
                             let store = store.lock().unwrap();
-                            store.xread(&streams)
+                            store.xread(&resolved_streams)
                         };
 
                         if !results.is_empty() || !should_block {
@@ -2167,9 +2186,112 @@ mod tests {
         let response = send_command(port, "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$3\r\n500\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n");
         let elapsed = start.elapsed();
 
-        // Should timeout and return null
-        assert_eq!(response, "$-1\r\n");
+        // Should timeout and return null array
+        assert_eq!(response, "*-1\r\n");
         // Should have waited at least 500ms
         assert!(elapsed >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_xread_dollar_with_block_new_entries() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some existing entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Spawn a thread to add a new entry after a short delay
+        use std::thread;
+        let port_clone = port;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            send_command(port_clone, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+        });
+
+        let start = Instant::now();
+        // XREAD with BLOCK and $ - should wait for new entry
+        let response = send_command(port, "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$4\r\n1000\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$1\r\n$\r\n");
+        let elapsed = start.elapsed();
+
+        // Should return the new entry (300-0) that was added after the call
+        assert!(response.contains("mystream"));
+        assert!(response.contains("300-0"));
+        assert!(response.contains("value3"));
+        // Should NOT contain the old entries
+        assert!(!response.contains("100-0"));
+        assert!(!response.contains("200-0"));
+        // Should have waited at least 200ms (the delay before adding)
+        assert!(elapsed >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_xread_dollar_nonblocking_returns_empty() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some existing entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // XREAD without BLOCK and $ should return empty (no new entries yet)
+        let response = send_command(port, "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$1\r\n$\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xread_dollar_with_nonexistent_stream() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Spawn a thread to create stream and add entry after delay
+        use std::thread;
+        let port_clone = port;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            send_command(port_clone, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        });
+
+        let start = Instant::now();
+        // XREAD with BLOCK and $ on non-existent stream - should wait and return new entry
+        let response = send_command(port, "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$4\r\n1000\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$1\r\n$\r\n");
+        let elapsed = start.elapsed();
+
+        // Should return the new entry
+        assert!(response.contains("mystream"));
+        assert!(response.contains("100-0"));
+        assert!(response.contains("value1"));
+        // Should have waited at least 200ms
+        assert!(elapsed >= Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_xread_dollar_multiple_streams() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries to both streams
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream1\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream2\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Spawn thread to add new entries to both streams
+        use std::thread;
+        let port_clone = port;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            send_command(port_clone, "*5\r\n$4\r\nXADD\r\n$7\r\nstream1\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+            send_command(port_clone, "*5\r\n$4\r\nXADD\r\n$7\r\nstream2\r\n$5\r\n400-0\r\n$5\r\nfield\r\n$6\r\nvalue4\r\n");
+        });
+
+        // XREAD with BLOCK and $ on both streams
+        let response = send_command(port, "*8\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$4\r\n1000\r\n$7\r\nSTREAMS\r\n$7\r\nstream1\r\n$7\r\nstream2\r\n$1\r\n$\r\n$1\r\n$\r\n");
+
+        // Should return at least one new entry (might not get both if timing is off)
+        // At minimum, should get stream1 with 300-0
+        assert!(response.contains("stream1"));
+        assert!(response.contains("300-0"));
+        assert!(response.contains("value3"));
+        // Should NOT contain old entries
+        assert!(!response.contains("100-0"));
+        assert!(!response.contains("200-0"));
     }
 }
