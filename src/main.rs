@@ -597,7 +597,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         if let Some(dl) = deadline {
                             if Instant::now() >= dl {
                                 // Timeout - return null
-                                break stream.write_all(b"$-1\r\n");
+                                break stream.write_all(b"*-1\r\n");
                             }
                         }
 
