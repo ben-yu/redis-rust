@@ -406,6 +406,9 @@ fn is_id_greater(id1: &str, id2: &str) -> bool {
 
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
     let mut buf = [0; 512];
+    let mut in_transaction = false;
+    let mut queued_commands: Vec<Command> = Vec::new();
+
     loop {
         let bytes_read = match stream.read(&mut buf) {
             Ok(0) => break, // Connection closed
@@ -418,6 +421,26 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
         let commands = parse_commands(&request);
 
         for command in commands {
+            // Handle MULTI command specially
+            if matches!(command, Command::Multi) {
+                if in_transaction {
+                    // Already in transaction
+                    let _ = stream.write_all(b"-ERR MULTI calls can not be nested\r\n");
+                } else {
+                    in_transaction = true;
+                    let _ = stream.write_all(b"+OK\r\n");
+                }
+                continue;
+            }
+
+            // If in transaction, queue the command instead of executing
+            if in_transaction {
+                queued_commands.push(command);
+                let _ = stream.write_all(b"+QUEUED\r\n");
+                continue;
+            }
+
+            // Execute command normally if not in transaction
             let result = match command {
                 Command::Ping => {
                     stream.write_all(b"+PONG\r\n")
@@ -666,6 +689,11 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
+                Command::Multi => {
+                    // Multi is handled above before reaching this match
+                    // This case is unreachable but needed for exhaustiveness
+                    stream.write_all(b"+OK\r\n")
+                }
             };
 
             if result.is_err() {
@@ -691,6 +719,7 @@ enum Command {
     XAdd(String, String, Vec<(String, String)>), // key, id, fields
     XRange(String, String, String), // key, start, end
     XRead(Option<u64>, Vec<(String, String)>), // optional block_ms, [(key, start_id)]
+    Multi, // Start transaction
 }
 
 struct Parser<'a> {
@@ -787,6 +816,9 @@ impl<'a> Parser<'a> {
             "INCR" => {
                 let key = self.read_bulk_string()?;
                 Some(Command::Incr(key))
+            }
+            "MULTI" => {
+                Some(Command::Multi)
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
@@ -1002,6 +1034,18 @@ mod tests {
 
     fn send_command(port: u16, command: &str) -> String {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        stream.write_all(command.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // Give server time to process
+        thread::sleep(Duration::from_millis(50));
+
+        let mut buf = [0; 512];
+        let bytes_read = stream.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..bytes_read]).to_string()
+    }
+
+    fn send_command_with_stream(stream: &mut TcpStream, command: &str) -> String {
         stream.write_all(command.as_bytes()).unwrap();
         stream.flush().unwrap();
 
@@ -2403,5 +2447,59 @@ mod tests {
         // Should NOT contain old entries
         assert!(!response.contains("100-0"));
         assert!(!response.contains("200-0"));
+    }
+
+    #[test]
+    fn test_parse_multi() {
+        let request = "*1\r\n$5\r\nMULTI\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Multi));
+    }
+
+    #[test]
+    fn test_multi_basic() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let response = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response, "+OK\r\n");
+    }
+
+    #[test]
+    fn test_multi_queues_commands() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Start transaction
+        let multi_response = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(multi_response, "+OK\r\n");
+
+        // Queue a SET command
+        let set_response = send_command_with_stream(&mut stream, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+        assert_eq!(set_response, "+QUEUED\r\n");
+
+        // Queue an INCR command
+        let incr_response = send_command_with_stream(&mut stream, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        assert_eq!(incr_response, "+QUEUED\r\n");
+    }
+
+    #[test]
+    fn test_multi_nested_error() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // First MULTI should succeed
+        let response1 = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response1, "+OK\r\n");
+
+        // Second MULTI should fail
+        let response2 = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(response2, "-ERR MULTI calls can not be nested\r\n");
     }
 }
