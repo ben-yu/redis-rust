@@ -188,6 +188,34 @@ impl Store {
         }
     }
 
+    fn xread(&self, streams: &[(String, String)]) -> Vec<(String, Vec<(String, Vec<(String, String)>)>)> {
+        let mut results = Vec::new();
+
+        for (key, start_id) in streams {
+            if let Some(Value::Stream(btree)) = self.data.get(key) {
+                let mut entries = Vec::new();
+
+                for (entry_id, fields) in btree.iter() {
+                    // For XREAD, we want entries AFTER the specified ID (exclusive)
+                    // unless the start_id is $, which means only new entries (none initially)
+                    if start_id == "$" {
+                        // $ means return entries added after this call, so initially return nothing
+                        continue;
+                    } else if entry_id.as_str() > start_id.as_str() {
+                        entries.push((entry_id.clone(), fields.clone()));
+                    }
+                }
+
+                // Only include streams that have entries
+                if !entries.is_empty() {
+                    results.push((key.clone(), entries));
+                }
+            }
+        }
+
+        results
+    }
+
     fn xadd(&mut self, key: String, id: String, fields: Vec<(String, String)>) -> Result<String, String> {
         // Get or create the stream
         let stream = self.data
@@ -514,6 +542,69 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         stream.write_all(b"*0\r\n")
                     }
                 }
+                Command::XRead(block_ms, streams) => {
+                    // Determine if we should block and for how long
+                    let should_block = block_ms.is_some();
+                    let deadline = block_ms.and_then(|ms| {
+                        if ms == 0 {
+                            None // Block indefinitely
+                        } else {
+                            Some(Instant::now() + Duration::from_millis(ms))
+                        }
+                    });
+
+                    loop {
+                        let results = {
+                            let store = store.lock().unwrap();
+                            store.xread(&streams)
+                        };
+
+                        if !results.is_empty() || !should_block {
+                            // Format: *<stream_count>\r\n
+                            // For each stream: *2\r\n$<key_len>\r\n<key>\r\n*<entries_count>\r\n<entries>
+                            let mut response = format!("*{}\r\n", results.len());
+
+                            for (key, entries) in results {
+                                // Each stream result is [key, entries]
+                                response.push_str("*2\r\n");
+
+                                // Stream key
+                                response.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+
+                                // Entries array
+                                response.push_str(&format!("*{}\r\n", entries.len()));
+
+                                for (entry_id, fields) in entries {
+                                    // Each entry is [id, [field, value, ...]]
+                                    response.push_str("*2\r\n");
+
+                                    // Entry ID
+                                    response.push_str(&format!("${}\r\n{}\r\n", entry_id.len(), entry_id));
+
+                                    // Fields array
+                                    response.push_str(&format!("*{}\r\n", fields.len() * 2));
+                                    for (field, value) in fields {
+                                        response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                                        response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                                    }
+                                }
+                            }
+
+                            break stream.write_all(response.as_bytes());
+                        }
+
+                        // Check if we should timeout
+                        if let Some(dl) = deadline {
+                            if Instant::now() >= dl {
+                                // Timeout - return null
+                                break stream.write_all(b"$-1\r\n");
+                            }
+                        }
+
+                        // Sleep briefly before checking again
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
             };
 
             if result.is_err() {
@@ -537,6 +628,7 @@ enum Command {
     Type(String), // key
     XAdd(String, String, Vec<(String, String)>), // key, id, fields
     XRange(String, String, String), // key, start, end
+    XRead(Option<u64>, Vec<(String, String)>), // optional block_ms, [(key, start_id)]
 }
 
 struct Parser<'a> {
@@ -734,6 +826,51 @@ impl<'a> Parser<'a> {
                 let start = self.read_bulk_string()?;
                 let end = self.read_bulk_string()?;
                 Some(Command::XRange(key, start, end))
+            }
+            "XREAD" => {
+                // XREAD [BLOCK milliseconds] STREAMS key [key ...] ID [ID ...]
+                let mut block_ms = None;
+                let mut args = Vec::new();
+
+                // Read all remaining arguments
+                while let Some(arg) = self.read_bulk_string() {
+                    args.push(arg);
+                }
+
+                // Parse arguments
+                let mut i = 0;
+                if i < args.len() && args[i].to_uppercase() == "BLOCK" {
+                    i += 1;
+                    if i < args.len() {
+                        if let Ok(ms) = args[i].parse::<u64>() {
+                            block_ms = Some(ms);
+                        }
+                        i += 1;
+                    }
+                }
+
+                // Expect STREAMS keyword
+                if i >= args.len() || args[i].to_uppercase() != "STREAMS" {
+                    return None;
+                }
+                i += 1;
+
+                // Read keys and IDs
+                let remaining = &args[i..];
+                if remaining.is_empty() || remaining.len() % 2 != 0 {
+                    return None; // Need equal number of keys and IDs
+                }
+
+                let count = remaining.len() / 2;
+                let keys = &remaining[..count];
+                let ids = &remaining[count..];
+
+                let streams: Vec<(String, String)> = keys.iter()
+                    .zip(ids.iter())
+                    .map(|(k, id)| (k.clone(), id.clone()))
+                    .collect();
+
+                Some(Command::XRead(block_ms, streams))
             }
             _ => None,
         }
@@ -1902,5 +2039,137 @@ mod tests {
         assert!(response.contains("100-0"));
         assert!(response.contains("200-0"));
         assert!(!response.contains("300-0"));
+    }
+
+    #[test]
+    fn test_parse_xread() {
+        let request = "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::XRead(block_ms, streams) => {
+                assert_eq!(*block_ms, None);
+                assert_eq!(streams.len(), 1);
+                assert_eq!(streams[0].0, "mystream");
+                assert_eq!(streams[0].1, "100-0");
+            }
+            _ => panic!("Expected XRead command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_xread_block() {
+        let request = "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$4\r\n1000\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::XRead(block_ms, streams) => {
+                assert_eq!(*block_ms, Some(1000));
+                assert_eq!(streams.len(), 1);
+                assert_eq!(streams[0].0, "mystream");
+                assert_eq!(streams[0].1, "100-0");
+            }
+            _ => panic!("Expected XRead command"),
+        }
+    }
+
+    #[test]
+    fn test_xread_basic() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+
+        // Read entries after 100-0
+        let response = send_command(port, "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n");
+
+        // Should return entries 200-0 and 300-0 (entries AFTER 100-0)
+        assert!(response.starts_with("*1\r\n")); // 1 stream
+        assert!(response.contains("mystream"));
+        assert!(!response.contains("100-0")); // 100-0 should not be included (exclusive)
+        assert!(response.contains("200-0"));
+        assert!(response.contains("300-0"));
+    }
+
+    #[test]
+    fn test_xread_multiple_streams() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add entries to first stream
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream1\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream1\r\n$5\r\n200-0\r\n$5\r\nfield\r\n$6\r\nvalue2\r\n");
+
+        // Add entries to second stream
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream2\r\n$5\r\n300-0\r\n$5\r\nfield\r\n$6\r\nvalue3\r\n");
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$7\r\nstream2\r\n$5\r\n400-0\r\n$5\r\nfield\r\n$6\r\nvalue4\r\n");
+
+        // Read from both streams
+        let response = send_command(port, "*6\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$7\r\nstream1\r\n$7\r\nstream2\r\n$5\r\n100-0\r\n$5\r\n300-0\r\n");
+
+        // Should return 2 streams
+        assert!(response.starts_with("*2\r\n"));
+        assert!(response.contains("stream1"));
+        assert!(response.contains("stream2"));
+        assert!(response.contains("200-0"));
+        assert!(response.contains("400-0"));
+    }
+
+    #[test]
+    fn test_xread_no_new_entries() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // Read after the last entry - should return empty
+        let response = send_command(port, "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xread_nonexistent_stream() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Read from non-existent stream
+        let response = send_command(port, "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xread_dollar_sign() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add some existing entries
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        // Read with $ (should not return existing entries)
+        let response = send_command(port, "*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$1\r\n$\r\n");
+        assert_eq!(response, "*0\r\n");
+    }
+
+    #[test]
+    fn test_xread_block_timeout() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Add an entry
+        send_command(port, "*5\r\n$4\r\nXADD\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n$5\r\nfield\r\n$6\r\nvalue1\r\n");
+
+        let start = Instant::now();
+        // XREAD with BLOCK that will timeout (no new entries after 100-0)
+        let response = send_command(port, "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$3\r\n500\r\n$7\r\nSTREAMS\r\n$8\r\nmystream\r\n$5\r\n100-0\r\n");
+        let elapsed = start.elapsed();
+
+        // Should timeout and return null
+        assert_eq!(response, "$-1\r\n");
+        // Should have waited at least 500ms
+        assert!(elapsed >= Duration::from_millis(500));
     }
 }
