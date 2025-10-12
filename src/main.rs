@@ -64,6 +64,35 @@ impl Store {
         }
     }
 
+    fn incr(&mut self, key: String) -> Result<i64, String> {
+        match self.data.get_mut(&key) {
+            Some(Value::String(val, expiry)) => {
+                // Check if expired
+                if expiry.map_or(false, |exp| Instant::now() > exp) {
+                    // Treat as non-existent
+                    self.data.insert(key, Value::String("1".to_string(), None));
+                    return Ok(1);
+                }
+
+                // Try to parse as integer
+                match val.parse::<i64>() {
+                    Ok(num) => {
+                        let new_val = num + 1;
+                        *val = new_val.to_string();
+                        Ok(new_val)
+                    }
+                    Err(_) => Err("ERR value is not an integer or out of range".to_string()),
+                }
+            }
+            Some(_) => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            None => {
+                // Key doesn't exist, initialize to 1
+                self.data.insert(key, Value::String("1".to_string(), None));
+                Ok(1)
+            }
+        }
+    }
+
     fn remove_if_expired(&mut self, key: &str) -> bool {
         if let Some(Value::String(_, expiry)) = self.data.get(key) {
             if expiry.map_or(false, |exp| Instant::now() > exp) {
@@ -414,6 +443,19 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         stream.write_all(b"$-1\r\n")
                     }
                 }
+                Command::Incr(key) => {
+                    let mut store = store.lock().unwrap();
+                    match store.incr(key) {
+                        Ok(value) => {
+                            let response = format!(":{}\r\n", value);
+                            stream.write_all(response.as_bytes())
+                        }
+                        Err(err) => {
+                            let response = format!("-{}\r\n", err);
+                            stream.write_all(response.as_bytes())
+                        }
+                    }
+                }
                 Command::RPush(key, values) => {
                     let mut store = store.lock().unwrap();
                     let len = store.rpush(key, values);
@@ -638,6 +680,7 @@ enum Command {
     Echo(String),
     Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
+    Incr(String), // key
     RPush(String, Vec<String>), // key, values
     LPush(String, Vec<String>), // key, values
     LRange(String, i64, i64), // key, start, stop
@@ -740,6 +783,10 @@ impl<'a> Parser<'a> {
             "GET" => {
                 let key = self.read_bulk_string()?;
                 Some(Command::Get(key))
+            }
+            "INCR" => {
+                let key = self.read_bulk_string()?;
+                Some(Command::Incr(key))
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
@@ -1008,6 +1055,58 @@ mod tests {
     }
 
     #[test]
+    fn test_incr_nonexistent_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        assert_eq!(response, ":1\r\n");
+    }
+
+    #[test]
+    fn test_incr_existing_key() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Set initial value
+        send_command(port, "*3\r\n$3\r\nSET\r\n$7\r\ncounter\r\n$2\r\n10\r\n");
+
+        // Increment
+        let response1 = send_command(port, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        assert_eq!(response1, ":11\r\n");
+
+        // Increment again
+        let response2 = send_command(port, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        assert_eq!(response2, ":12\r\n");
+    }
+
+    #[test]
+    fn test_incr_not_integer() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Set non-integer value
+        send_command(port, "*3\r\n$3\r\nSET\r\n$6\r\nmykey1\r\n$5\r\nhello\r\n");
+
+        // Try to increment
+        let response = send_command(port, "*2\r\n$4\r\nINCR\r\n$6\r\nmykey1\r\n");
+        assert!(response.starts_with("-ERR"));
+    }
+
+    #[test]
+    fn test_incr_wrong_type() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        // Create a list
+        send_command(port, "*3\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$5\r\nvalue\r\n");
+
+        // Try to increment
+        let response = send_command(port, "*2\r\n$4\r\nINCR\r\n$6\r\nmylist\r\n");
+        assert!(response.starts_with("-WRONGTYPE"));
+    }
+
+    #[test]
     fn test_set_with_expiry() {
         let (_server, port) = start_test_server();
         thread::sleep(Duration::from_millis(100));
@@ -1119,6 +1218,17 @@ mod tests {
         match &commands[0] {
             Command::Get(key) => assert_eq!(key, "mykey1"),
             _ => panic!("Expected Get command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_incr() {
+        let request = "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Incr(key) => assert_eq!(key, "counter"),
+            _ => panic!("Expected Incr command"),
         }
     }
 
