@@ -6,11 +6,27 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
     thread,
+    env,
 };
 use threadpool::ThreadPool;
 
 fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    // Parse command-line arguments for port
+    let args: Vec<String> = env::args().collect();
+    let mut port = 6379; // Default port
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--port" && i + 1 < args.len() {
+            port = args[i + 1].parse().unwrap_or(6379);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
+    println!("Listening on port {}", port);
     let pool = ThreadPool::new(4);
     let store = Arc::new(Mutex::new(Store::new()));
 
