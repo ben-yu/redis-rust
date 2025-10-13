@@ -115,6 +115,26 @@ fn main() {
                         }
                     }
 
+                    // Step 4: Send PSYNC ? -1
+                    let psync_command = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n";
+                    if let Err(e) = master_stream.write_all(psync_command.as_bytes()) {
+                        eprintln!("Failed to send PSYNC: {}", e);
+                    } else {
+                        println!("Sent PSYNC ? -1");
+
+                        // Read PSYNC response
+                        let mut buf = [0; 512];
+                        match master_stream.read(&mut buf) {
+                            Ok(n) => {
+                                let response = String::from_utf8_lossy(&buf[..n]);
+                                println!("Received PSYNC response: {:?}", response);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read PSYNC response: {}", e);
+                            }
+                        }
+                    }
+
                     println!("Handshake completed successfully");
                 }
             }
@@ -636,6 +656,10 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // REPLCONF always responds with +OK
             "+OK\r\n".to_string()
         }
+        Command::PSync(_repl_id, _offset) => {
+            // PSYNC responds with FULLRESYNC
+            "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n".to_string()
+        }
         Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
@@ -982,6 +1006,11 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     // REPLCONF always responds with +OK
                     stream.write_all(b"+OK\r\n")
                 }
+                Command::PSync(_repl_id, _offset) => {
+                    // PSYNC responds with FULLRESYNC
+                    let response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n";
+                    stream.write_all(response.as_bytes())
+                }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
                     // This case is unreachable but needed for exhaustiveness
@@ -1017,6 +1046,7 @@ enum Command {
     Exec, // Execute transaction
     Discard, // Discard transaction
     ReplConf(Vec<String>), // Replication configuration
+    PSync(String, String), // replication_id, offset
 }
 
 struct Parser<'a> {
@@ -1135,6 +1165,11 @@ impl<'a> Parser<'a> {
                     args.push(arg);
                 }
                 Some(Command::ReplConf(args))
+            }
+            "PSYNC" => {
+                let repl_id = self.read_bulk_string()?;
+                let offset = self.read_bulk_string()?;
+                Some(Command::PSync(repl_id, offset))
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
