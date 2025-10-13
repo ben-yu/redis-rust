@@ -58,17 +58,64 @@ fn main() {
                 } else {
                     println!("Sent PING to master");
 
-                    // Read response
+                    // Read PING response
                     let mut buf = [0; 512];
                     match master_stream.read(&mut buf) {
                         Ok(n) => {
                             let response = String::from_utf8_lossy(&buf[..n]);
-                            println!("Received from master: {:?}", response);
+                            println!("Received PING response: {:?}", response);
                         }
                         Err(e) => {
-                            eprintln!("Failed to read response from master: {}", e);
+                            eprintln!("Failed to read PING response: {}", e);
                         }
                     }
+
+                    // Step 2: Send REPLCONF listening-port
+                    let port_str = port.to_string();
+                    let replconf_port = format!(
+                        "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${}\r\n{}\r\n",
+                        port_str.len(),
+                        port_str
+                    );
+                    if let Err(e) = master_stream.write_all(replconf_port.as_bytes()) {
+                        eprintln!("Failed to send REPLCONF listening-port: {}", e);
+                    } else {
+                        println!("Sent REPLCONF listening-port {}", port);
+
+                        // Read REPLCONF response
+                        let mut buf = [0; 512];
+                        match master_stream.read(&mut buf) {
+                            Ok(n) => {
+                                let response = String::from_utf8_lossy(&buf[..n]);
+                                println!("Received REPLCONF listening-port response: {:?}", response);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read REPLCONF response: {}", e);
+                            }
+                        }
+                    }
+
+                    // Step 3: Send REPLCONF capa psync2
+                    let replconf_capa = "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
+                    if let Err(e) = master_stream.write_all(replconf_capa.as_bytes()) {
+                        eprintln!("Failed to send REPLCONF capa: {}", e);
+                    } else {
+                        println!("Sent REPLCONF capa psync2");
+
+                        // Read REPLCONF capa response
+                        let mut buf = [0; 512];
+                        match master_stream.read(&mut buf) {
+                            Ok(n) => {
+                                let response = String::from_utf8_lossy(&buf[..n]);
+                                println!("Received REPLCONF capa response: {:?}", response);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read REPLCONF capa response: {}", e);
+                            }
+                        }
+                    }
+
+                    println!("Handshake completed successfully");
                 }
             }
             Err(e) => {
@@ -585,6 +632,10 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // XRead with blocking cannot be used in transactions
             "-ERR XREAD with BLOCK cannot be used in transactions\r\n".to_string()
         }
+        Command::ReplConf(_args) => {
+            // REPLCONF always responds with +OK
+            "+OK\r\n".to_string()
+        }
         Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
@@ -927,6 +978,10 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
+                Command::ReplConf(_args) => {
+                    // REPLCONF always responds with +OK
+                    stream.write_all(b"+OK\r\n")
+                }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
                     // This case is unreachable but needed for exhaustiveness
@@ -961,6 +1016,7 @@ enum Command {
     Multi, // Start transaction
     Exec, // Execute transaction
     Discard, // Discard transaction
+    ReplConf(Vec<String>), // Replication configuration
 }
 
 struct Parser<'a> {
@@ -1071,6 +1127,14 @@ impl<'a> Parser<'a> {
             }
             "DISCARD" => {
                 Some(Command::Discard)
+            }
+            "REPLCONF" => {
+                // Read all remaining arguments
+                let mut args = Vec::new();
+                while let Some(arg) = self.read_bulk_string() {
+                    args.push(arg);
+                }
+                Some(Command::ReplConf(args))
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
