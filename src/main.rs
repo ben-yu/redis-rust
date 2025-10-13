@@ -404,6 +404,121 @@ fn is_id_greater(id1: &str, id2: &str) -> bool {
     }
 }
 
+fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>) -> String {
+    match command {
+        Command::Ping => "+PONG\r\n".to_string(),
+        Command::Echo(msg) => format!("${}\r\n{}\r\n", msg.len(), msg),
+        Command::Set(key, value, expiry_ms) => {
+            let mut store = store.lock().unwrap();
+            let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+            store.set(key, value, expiry);
+            "+OK\r\n".to_string()
+        }
+        Command::Get(key) => {
+            let mut store = store.lock().unwrap();
+            if store.remove_if_expired(&key) {
+                "$-1\r\n".to_string()
+            } else if let Some(value) = store.get(&key) {
+                format!("${}\r\n{}\r\n", value.len(), value)
+            } else {
+                "$-1\r\n".to_string()
+            }
+        }
+        Command::Incr(key) => {
+            let mut store = store.lock().unwrap();
+            match store.incr(key) {
+                Ok(value) => format!(":{}\r\n", value),
+                Err(err) => format!("-{}\r\n", err),
+            }
+        }
+        Command::RPush(key, values) => {
+            let mut store = store.lock().unwrap();
+            let len = store.rpush(key, values);
+            format!(":{}\r\n", len)
+        }
+        Command::LPush(key, values) => {
+            let mut store = store.lock().unwrap();
+            let len = store.lpush(key, values);
+            format!(":{}\r\n", len)
+        }
+        Command::LRange(key, start, stop) => {
+            let store = store.lock().unwrap();
+            if let Some(values) = store.lrange(&key, start, stop) {
+                let mut response = format!("*{}\r\n", values.len());
+                for value in values {
+                    response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                }
+                response
+            } else {
+                "*0\r\n".to_string()
+            }
+        }
+        Command::LLen(key) => {
+            let store = store.lock().unwrap();
+            let len = store.llen(&key);
+            format!(":{}\r\n", len)
+        }
+        Command::LPop(key, count) => {
+            let mut store = store.lock().unwrap();
+            if let Some(values) = store.lpop(&key, count) {
+                if count.is_some() {
+                    let mut response = format!("*{}\r\n", values.len());
+                    for value in values {
+                        response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                    }
+                    response
+                } else {
+                    let value = &values[0];
+                    format!("${}\r\n{}\r\n", value.len(), value)
+                }
+            } else {
+                "$-1\r\n".to_string()
+            }
+        }
+        Command::BLPop(_, _) => {
+            // BLPop cannot be used in transactions (blocking operation)
+            "-ERR BLPOP cannot be used in transactions\r\n".to_string()
+        }
+        Command::Type(key) => {
+            let store = store.lock().unwrap();
+            let type_str = store.get_type(&key);
+            format!("+{}\r\n", type_str)
+        }
+        Command::XAdd(key, id, fields) => {
+            let mut store = store.lock().unwrap();
+            match store.xadd(key, id, fields) {
+                Ok(generated_id) => format!("${}\r\n{}\r\n", generated_id.len(), generated_id),
+                Err(err) => format!("-{}\r\n", err),
+            }
+        }
+        Command::XRange(key, start, end) => {
+            let store = store.lock().unwrap();
+            if let Some(entries) = store.xrange(&key, &start, &end) {
+                let mut response = format!("*{}\r\n", entries.len());
+                for (id, fields) in entries {
+                    response.push_str(&format!("*2\r\n${}\r\n{}\r\n", id.len(), id));
+                    response.push_str(&format!("*{}\r\n", fields.len() * 2));
+                    for (field, value) in fields {
+                        response.push_str(&format!("${}\r\n{}\r\n", field.len(), field));
+                        response.push_str(&format!("${}\r\n{}\r\n", value.len(), value));
+                    }
+                }
+                response
+            } else {
+                "*0\r\n".to_string()
+            }
+        }
+        Command::XRead(_, _) => {
+            // XRead with blocking cannot be used in transactions
+            "-ERR XREAD with BLOCK cannot be used in transactions\r\n".to_string()
+        }
+        Command::Multi | Command::Exec => {
+            // These are handled specially and should not reach here
+            "+OK\r\n".to_string()
+        }
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
@@ -429,6 +544,33 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                 } else {
                     in_transaction = true;
                     let _ = stream.write_all(b"+OK\r\n");
+                }
+                continue;
+            }
+
+            // Handle EXEC command specially
+            if matches!(command, Command::Exec) {
+                if !in_transaction {
+                    // Not in transaction
+                    let _ = stream.write_all(b"-ERR EXEC without MULTI\r\n");
+                } else {
+                    // Execute all queued commands and collect results
+                    let mut results = Vec::new();
+
+                    for queued_cmd in queued_commands.drain(..) {
+                        let result = execute_command_to_string(queued_cmd, &store);
+                        results.push(result);
+                    }
+
+                    // Reset transaction state
+                    in_transaction = false;
+
+                    // Return array of results
+                    let mut response = format!("*{}\r\n", results.len());
+                    for result in results {
+                        response.push_str(&result);
+                    }
+                    let _ = stream.write_all(response.as_bytes());
                 }
                 continue;
             }
@@ -689,8 +831,8 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
-                Command::Multi => {
-                    // Multi is handled above before reaching this match
+                Command::Multi | Command::Exec => {
+                    // Multi and Exec are handled above before reaching this match
                     // This case is unreachable but needed for exhaustiveness
                     stream.write_all(b"+OK\r\n")
                 }
@@ -720,6 +862,7 @@ enum Command {
     XRange(String, String, String), // key, start, end
     XRead(Option<u64>, Vec<(String, String)>), // optional block_ms, [(key, start_id)]
     Multi, // Start transaction
+    Exec, // Execute transaction
 }
 
 struct Parser<'a> {
@@ -819,6 +962,9 @@ impl<'a> Parser<'a> {
             }
             "MULTI" => {
                 Some(Command::Multi)
+            }
+            "EXEC" => {
+                Some(Command::Exec)
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
@@ -2501,5 +2647,76 @@ mod tests {
         // Second MULTI should fail
         let response2 = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
         assert_eq!(response2, "-ERR MULTI calls can not be nested\r\n");
+    }
+
+    #[test]
+    fn test_parse_exec() {
+        let request = "*1\r\n$4\r\nEXEC\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Exec));
+    }
+
+    #[test]
+    fn test_exec_without_multi() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let response = send_command_with_stream(&mut stream, "*1\r\n$4\r\nEXEC\r\n");
+        assert_eq!(response, "-ERR EXEC without MULTI\r\n");
+    }
+
+    #[test]
+    fn test_exec_executes_queued_commands() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Start transaction
+        let multi_response = send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+        assert_eq!(multi_response, "+OK\r\n");
+
+        // Queue SET command
+        let set_response = send_command_with_stream(&mut stream, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+        assert_eq!(set_response, "+QUEUED\r\n");
+
+        // Queue GET command
+        let get_response = send_command_with_stream(&mut stream, "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+        assert_eq!(get_response, "+QUEUED\r\n");
+
+        // Execute transaction
+        let exec_response = send_command_with_stream(&mut stream, "*1\r\n$4\r\nEXEC\r\n");
+
+        // Should return array with 2 results: +OK for SET and the value for GET
+        assert!(exec_response.starts_with("*2\r\n"));
+        assert!(exec_response.contains("+OK\r\n"));
+        assert!(exec_response.contains("$5\r\nvalue\r\n"));
+    }
+
+    #[test]
+    fn test_exec_with_incr() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Start transaction
+        send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+
+        // Queue INCR commands
+        send_command_with_stream(&mut stream, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        send_command_with_stream(&mut stream, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+        send_command_with_stream(&mut stream, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+
+        // Execute transaction
+        let exec_response = send_command_with_stream(&mut stream, "*1\r\n$4\r\nEXEC\r\n");
+
+        // Should return array with 3 results: :1, :2, :3
+        assert!(exec_response.starts_with("*3\r\n"));
+        assert!(exec_response.contains(":1\r\n"));
+        assert!(exec_response.contains(":2\r\n"));
+        assert!(exec_response.contains(":3\r\n"));
     }
 }
