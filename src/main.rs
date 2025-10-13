@@ -512,7 +512,7 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>) -> Str
             // XRead with blocking cannot be used in transactions
             "-ERR XREAD with BLOCK cannot be used in transactions\r\n".to_string()
         }
-        Command::Multi | Command::Exec => {
+        Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
         }
@@ -571,6 +571,20 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         response.push_str(&result);
                     }
                     let _ = stream.write_all(response.as_bytes());
+                }
+                continue;
+            }
+
+            // Handle DISCARD command specially
+            if matches!(command, Command::Discard) {
+                if !in_transaction {
+                    // Not in transaction
+                    let _ = stream.write_all(b"-ERR DISCARD without MULTI\r\n");
+                } else {
+                    // Clear queued commands and reset transaction state
+                    queued_commands.clear();
+                    in_transaction = false;
+                    let _ = stream.write_all(b"+OK\r\n");
                 }
                 continue;
             }
@@ -831,8 +845,8 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                         thread::sleep(Duration::from_millis(10));
                     }
                 }
-                Command::Multi | Command::Exec => {
-                    // Multi and Exec are handled above before reaching this match
+                Command::Multi | Command::Exec | Command::Discard => {
+                    // Multi, Exec, and Discard are handled above before reaching this match
                     // This case is unreachable but needed for exhaustiveness
                     stream.write_all(b"+OK\r\n")
                 }
@@ -863,6 +877,7 @@ enum Command {
     XRead(Option<u64>, Vec<(String, String)>), // optional block_ms, [(key, start_id)]
     Multi, // Start transaction
     Exec, // Execute transaction
+    Discard, // Discard transaction
 }
 
 struct Parser<'a> {
@@ -965,6 +980,9 @@ impl<'a> Parser<'a> {
             }
             "EXEC" => {
                 Some(Command::Exec)
+            }
+            "DISCARD" => {
+                Some(Command::Discard)
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
@@ -2718,5 +2736,75 @@ mod tests {
         assert!(exec_response.contains(":1\r\n"));
         assert!(exec_response.contains(":2\r\n"));
         assert!(exec_response.contains(":3\r\n"));
+    }
+
+    #[test]
+    fn test_parse_discard() {
+        let request = "*1\r\n$7\r\nDISCARD\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], Command::Discard));
+    }
+
+    #[test]
+    fn test_discard_without_multi() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let response = send_command_with_stream(&mut stream, "*1\r\n$7\r\nDISCARD\r\n");
+        assert_eq!(response, "-ERR DISCARD without MULTI\r\n");
+    }
+
+    #[test]
+    fn test_discard_clears_queue() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Start transaction
+        send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+
+        // Queue some commands
+        send_command_with_stream(&mut stream, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+        send_command_with_stream(&mut stream, "*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n");
+
+        // Discard transaction
+        let discard_response = send_command_with_stream(&mut stream, "*1\r\n$7\r\nDISCARD\r\n");
+        assert_eq!(discard_response, "+OK\r\n");
+
+        // Verify that key was not set
+        let get_response = send_command_with_stream(&mut stream, "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
+        assert_eq!(get_response, "$-1\r\n");
+
+        // Verify that counter was not incremented
+        let get_counter_response = send_command_with_stream(&mut stream, "*2\r\n$3\r\nGET\r\n$7\r\ncounter\r\n");
+        assert_eq!(get_counter_response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_discard_resets_transaction_state() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+        // Start transaction
+        send_command_with_stream(&mut stream, "*1\r\n$5\r\nMULTI\r\n");
+
+        // Queue a command
+        send_command_with_stream(&mut stream, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+
+        // Discard transaction
+        send_command_with_stream(&mut stream, "*1\r\n$7\r\nDISCARD\r\n");
+
+        // Should be able to execute commands normally now (not in transaction)
+        let set_response = send_command_with_stream(&mut stream, "*3\r\n$3\r\nSET\r\n$4\r\nkey2\r\n$6\r\nvalue2\r\n");
+        assert_eq!(set_response, "+OK\r\n");
+
+        // Verify key2 was set
+        let get_response = send_command_with_stream(&mut stream, "*2\r\n$3\r\nGET\r\n$4\r\nkey2\r\n");
+        assert_eq!(get_response, "$6\r\nvalue2\r\n");
     }
 }
