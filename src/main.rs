@@ -424,6 +424,12 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>) -> Str
     match command {
         Command::Ping => "+PONG\r\n".to_string(),
         Command::Echo(msg) => format!("${}\r\n{}\r\n", msg.len(), msg),
+        Command::Info(_section) => {
+            // Return server information as bulk string
+            // Each line is key:value format
+            let info = "role:master\r\n";
+            format!("${}\r\n{}\r\n", info.len(), info)
+        }
         Command::Set(key, value, expiry_ms) => {
             let mut store = store.lock().unwrap();
             let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -619,6 +625,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                 }
                 Command::Echo(msg) => {
                     let response = format!("${}\r\n{}\r\n", msg.len(), msg);
+                    stream.write_all(response.as_bytes())
+                }
+                Command::Info(_section) => {
+                    // Return server information as bulk string
+                    let info = "role:master\r\n";
+                    let response = format!("${}\r\n{}\r\n", info.len(), info);
                     stream.write_all(response.as_bytes())
                 }
                 Command::Set(key, value, expiry_ms) => {
@@ -878,6 +890,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
 enum Command {
     Ping,
     Echo(String),
+    Info(Option<String>), // optional section (e.g., "replication")
     Set(String, String, Option<u64>), // key, value, optional expiry in ms
     Get(String),
     Incr(String), // key
@@ -956,6 +969,11 @@ impl<'a> Parser<'a> {
             "ECHO" => {
                 let msg = self.read_bulk_string()?;
                 Some(Command::Echo(msg))
+            }
+            "INFO" => {
+                // INFO can optionally take a section argument
+                let section = self.read_bulk_string();
+                Some(Command::Info(section))
             }
             "SET" => {
                 let key = self.read_bulk_string()?;
@@ -1387,6 +1405,54 @@ mod tests {
             Command::Echo(msg) => assert_eq!(msg, ""),
             _ => panic!("Expected Echo command"),
         }
+    }
+
+    #[test]
+    fn test_parse_info() {
+        let request = "*1\r\n$4\r\nINFO\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Info(section) => assert!(section.is_none()),
+            _ => panic!("Expected Info command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_info_with_section() {
+        let request = "*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n";
+        let commands = parse_commands(request);
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::Info(section) => assert_eq!(section.as_ref().unwrap(), "replication"),
+            _ => panic!("Expected Info command"),
+        }
+    }
+
+    #[test]
+    fn test_info_command() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*1\r\n$4\r\nINFO\r\n");
+
+        // Should return bulk string
+        assert!(response.starts_with("$"));
+        // Should contain role:master
+        assert!(response.contains("role:master"));
+    }
+
+    #[test]
+    fn test_info_replication_command() {
+        let (_server, port) = start_test_server();
+        thread::sleep(Duration::from_millis(100));
+
+        let response = send_command(port, "*2\r\n$4\r\nINFO\r\n$11\r\nreplication\r\n");
+
+        // Should return bulk string
+        assert!(response.starts_with("$"));
+        // Should contain role:master
+        assert!(response.contains("role:master"));
     }
 
     #[test]
