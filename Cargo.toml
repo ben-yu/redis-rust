@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.59"                                   # error handling
 bytes = "1.3.0"                                     # helps manage buffers
+hex = "0.4"                                         # hex encoding/decoding
 thiserror = "1.0.32"                                # error handling
 threadpool = "1.8.1"
 tokio = { version = "1.23.0", features = ["full"] } # async networking

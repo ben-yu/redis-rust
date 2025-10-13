@@ -1007,9 +1007,16 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     stream.write_all(b"+OK\r\n")
                 }
                 Command::PSync(_repl_id, _offset) => {
-                    // PSYNC responds with FULLRESYNC
+                    // PSYNC responds with FULLRESYNC followed by an empty RDB file
                     let response = "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n";
-                    stream.write_all(response.as_bytes())
+                    stream.write_all(response.as_bytes()).ok();
+
+                    // Send empty RDB file as a RESP bulk string
+                    // Empty RDB file in hex: 524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2
+                    let empty_rdb = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap();
+                    let rdb_response = format!("${}\r\n", empty_rdb.len());
+                    stream.write_all(rdb_response.as_bytes()).ok();
+                    stream.write_all(&empty_rdb)
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
