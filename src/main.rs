@@ -11,32 +11,47 @@ use std::{
 use threadpool::ThreadPool;
 
 fn main() {
-    // Parse command-line arguments for port
+    // Parse command-line arguments for port and replication
     let args: Vec<String> = env::args().collect();
     let mut port = 6379; // Default port
+    let mut replica_of: Option<(String, u16)> = None; // (host, port)
 
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--port" && i + 1 < args.len() {
             port = args[i + 1].parse().unwrap_or(6379);
             i += 2;
+        } else if args[i] == "--replicaof" && i + 1 < args.len() {
+            // Parse "host port" as a single string
+            let replicaof_str = &args[i + 1];
+            let parts: Vec<&str> = replicaof_str.split_whitespace().collect();
+            if parts.len() == 2 {
+                let host = parts[0].to_string();
+                let master_port = parts[1].parse().unwrap_or(6379);
+                replica_of = Some((host, master_port));
+            }
+            i += 2;
         } else {
             i += 1;
         }
     }
 
+    let role = if replica_of.is_some() { "slave" } else { "master" };
+
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
-    println!("Listening on port {}", port);
+    println!("Listening on port {} as {}", port, role);
     let pool = ThreadPool::new(4);
     let store = Arc::new(Mutex::new(Store::new()));
+    let role = Arc::new(role.to_string());
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 println!("accepted new connection");
                 let store_clone = Arc::clone(&store);
+                let role_clone = Arc::clone(&role);
                 pool.execute(move || {
-                    handle_connection(stream, store_clone);
+                    handle_connection(stream, store_clone, role_clone);
                 });
             }
             Err(e) => {
@@ -420,14 +435,14 @@ fn is_id_greater(id1: &str, id2: &str) -> bool {
     }
 }
 
-fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>) -> String {
+fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: &str) -> String {
     match command {
         Command::Ping => "+PONG\r\n".to_string(),
         Command::Echo(msg) => format!("${}\r\n{}\r\n", msg.len(), msg),
         Command::Info(_section) => {
             // Return server information as bulk string
             // Each line is key:value format
-            let info = "role:master\r\n";
+            let info = format!("role:{}\r\n", role);
             format!("${}\r\n{}\r\n", info.len(), info)
         }
         Command::Set(key, value, expiry_ms) => {
@@ -541,7 +556,7 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>) -> Str
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -580,7 +595,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                     let mut results = Vec::new();
 
                     for queued_cmd in queued_commands.drain(..) {
-                        let result = execute_command_to_string(queued_cmd, &store);
+                        let result = execute_command_to_string(queued_cmd, &store, role.as_str());
                         results.push(result);
                     }
 
@@ -629,7 +644,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>) {
                 }
                 Command::Info(_section) => {
                     // Return server information as bulk string
-                    let info = "role:master\r\n";
+                    let info = format!("role:{}\r\n", role.as_str());
                     let response = format!("${}\r\n{}\r\n", info.len(), info);
                     stream.write_all(response.as_bytes())
                 }
@@ -1205,13 +1220,15 @@ mod tests {
             println!("Listening on port {}", port);
             let pool = ThreadPool::new(10);
             let store = Arc::new(Mutex::new(Store::new()));
+            let role = Arc::new("master".to_string());
 
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let store_clone = Arc::clone(&store);
+                        let role_clone = Arc::clone(&role);
                         pool.execute(move || {
-                            handle_connection(stream, store_clone);
+                            handle_connection(stream, store_clone, role_clone);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
