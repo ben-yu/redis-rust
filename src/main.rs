@@ -442,7 +442,10 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
         Command::Info(_section) => {
             // Return server information as bulk string
             // Each line is key:value format
-            let info = format!("role:{}\r\n", role);
+            let info = format!(
+                "role:{}\r\nmaster_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\nmaster_repl_offset:0\r\n",
+                role
+            );
             format!("${}\r\n{}\r\n", info.len(), info)
         }
         Command::Set(key, value, expiry_ms) => {
@@ -644,7 +647,10 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 }
                 Command::Info(_section) => {
                     // Return server information as bulk string
-                    let info = format!("role:{}\r\n", role.as_str());
+                    let info = format!(
+                        "role:{}\r\nmaster_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb\r\nmaster_repl_offset:0\r\n",
+                        role.as_str()
+                    );
                     let response = format!("${}\r\n{}\r\n", info.len(), info);
                     stream.write_all(response.as_bytes())
                 }
@@ -1457,6 +1463,10 @@ mod tests {
         assert!(response.starts_with("$"));
         // Should contain role:master
         assert!(response.contains("role:master"));
+        // Should contain master_replid
+        assert!(response.contains("master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"));
+        // Should contain master_repl_offset
+        assert!(response.contains("master_repl_offset:0"));
     }
 
     #[test]
