@@ -44,6 +44,39 @@ fn main() {
     let store = Arc::new(Mutex::new(Store::new()));
     let role = Arc::new(role.to_string());
 
+    // If in replica mode, initiate handshake with master
+    if let Some((master_host, master_port)) = replica_of {
+        println!("Connecting to master at {}:{}", master_host, master_port);
+        match TcpStream::connect(format!("{}:{}", master_host, master_port)) {
+            Ok(mut master_stream) => {
+                println!("Connected to master, starting handshake");
+
+                // Step 1: Send PING as RESP array
+                let ping_command = "*1\r\n$4\r\nPING\r\n";
+                if let Err(e) = master_stream.write_all(ping_command.as_bytes()) {
+                    eprintln!("Failed to send PING to master: {}", e);
+                } else {
+                    println!("Sent PING to master");
+
+                    // Read response
+                    let mut buf = [0; 512];
+                    match master_stream.read(&mut buf) {
+                        Ok(n) => {
+                            let response = String::from_utf8_lossy(&buf[..n]);
+                            println!("Received from master: {:?}", response);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to read response from master: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to master: {}", e);
+            }
+        }
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
