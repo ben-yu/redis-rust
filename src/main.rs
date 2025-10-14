@@ -144,6 +144,8 @@ fn main() {
                     thread::spawn(move || {
                         println!("Starting replication command processor");
                         let mut buf = [0; 512];
+                        let mut repl_offset: usize = 0;
+
                         loop {
                             match master_stream.read(&mut buf) {
                                 Ok(0) => {
@@ -158,9 +160,30 @@ fn main() {
                                     let commands = parse_commands(&request);
                                     for command in commands {
                                         println!("Executing command from master: {:?}", command);
-                                        // Execute command but don't send response back to master
-                                        execute_command_silently(command, &store_for_replication, role_for_replication.as_str());
+
+                                        // Check if this is REPLCONF GETACK
+                                        if let Command::ReplConf(args) = &command {
+                                            if args.len() >= 1 && args[0].to_uppercase() == "GETACK" {
+                                                // Respond with REPLCONF ACK <offset>
+                                                let ack_response = format!(
+                                                    "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
+                                                    repl_offset.to_string().len(),
+                                                    repl_offset
+                                                );
+                                                if let Err(e) = master_stream.write_all(ack_response.as_bytes()) {
+                                                    eprintln!("Failed to send ACK: {}", e);
+                                                    break;
+                                                }
+                                                println!("Sent REPLCONF ACK {}", repl_offset);
+                                            }
+                                        } else {
+                                            // Execute command but don't send response back to master
+                                            execute_command_silently(command, &store_for_replication, role_for_replication.as_str());
+                                        }
                                     }
+
+                                    // Update replication offset with number of bytes processed
+                                    repl_offset += n;
                                 }
                                 Err(e) => {
                                     eprintln!("Error reading from master: {}", e);
