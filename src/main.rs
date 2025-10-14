@@ -137,6 +137,39 @@ fn main() {
                     }
 
                     println!("Handshake completed successfully");
+
+                    // Spawn a thread to continuously read commands from master
+                    let store_for_replication = Arc::clone(&store);
+                    let role_for_replication = Arc::clone(&role);
+                    thread::spawn(move || {
+                        println!("Starting replication command processor");
+                        let mut buf = [0; 512];
+                        loop {
+                            match master_stream.read(&mut buf) {
+                                Ok(0) => {
+                                    println!("Master connection closed");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    let request = String::from_utf8_lossy(&buf[..n]);
+                                    println!("Received from master: {:?}", request);
+
+                                    // Parse and execute commands from master
+                                    let commands = parse_commands(&request);
+                                    for command in commands {
+                                        println!("Executing command from master: {:?}", command);
+                                        // Execute command but don't send response back to master
+                                        execute_command_silently(command, &store_for_replication, role_for_replication.as_str());
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error reading from master: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        println!("Replication command processor stopped");
+                    });
                 }
             }
             Err(e) => {
@@ -669,6 +702,42 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
     }
 }
 
+// Execute command silently (for replicas processing commands from master)
+// This function executes the command but doesn't generate any response
+fn execute_command_silently(command: Command, store: &Arc<Mutex<Store>>, _role: &str) {
+    match command {
+        Command::Set(key, value, expiry_ms) => {
+            let mut store = store.lock().unwrap();
+            let expiry = expiry_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+            store.set(key, value, expiry);
+        }
+        Command::Incr(key) => {
+            let mut store = store.lock().unwrap();
+            let _ = store.incr(key);
+        }
+        Command::RPush(key, values) => {
+            let mut store = store.lock().unwrap();
+            store.rpush(key, values);
+        }
+        Command::LPush(key, values) => {
+            let mut store = store.lock().unwrap();
+            store.lpush(key, values);
+        }
+        Command::LPop(key, count) => {
+            let mut store = store.lock().unwrap();
+            store.lpop(&key, count);
+        }
+        Command::XAdd(key, id, fields) => {
+            let mut store = store.lock().unwrap();
+            let _ = store.xadd(key, id, fields);
+        }
+        _ => {
+            // Other commands are ignored on replicas during replication
+            println!("Ignoring non-write command from master: {:?}", command);
+        }
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<TcpStream>>>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
@@ -1065,6 +1134,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
     }
 }
 
+#[derive(Debug)]
 enum Command {
     Ping,
     Echo(String),
