@@ -123,12 +123,46 @@ fn main() {
                     } else {
                         println!("Sent PSYNC ? -1");
 
-                        // Read PSYNC response
-                        let mut buf = [0; 512];
+                        // Read PSYNC response (FULLRESYNC)
+                        let mut buf = [0; 1024];
                         match master_stream.read(&mut buf) {
                             Ok(n) => {
                                 let response = String::from_utf8_lossy(&buf[..n]);
-                                println!("Received PSYNC response: {:?}", response);
+                                println!("Received PSYNC response (first {} bytes): {:?}", n, &response[..std::cmp::min(100, response.len())]);
+
+                                // The response contains:
+                                // 1. +FULLRESYNC <repl_id> <offset>\r\n
+                                // 2. $<rdb_length>\r\n<rdb_data>
+
+                                // Find where the RDB bulk string starts (after FULLRESYNC line)
+                                if let Some(fullresync_end) = response.find("\r\n") {
+                                    let after_fullresync = &response[fullresync_end + 2..];
+
+                                    // Parse the RDB bulk string length: $<length>\r\n
+                                    if after_fullresync.starts_with('$') {
+                                        if let Some(rdb_header_end) = after_fullresync.find("\r\n") {
+                                            let length_str = &after_fullresync[1..rdb_header_end];
+                                            if let Ok(rdb_length) = length_str.parse::<usize>() {
+                                                println!("RDB file length: {} bytes", rdb_length);
+
+                                                // Calculate how many bytes we've already read
+                                                let rdb_data_start = fullresync_end + 2 + rdb_header_end + 2;
+                                                let already_read = n - rdb_data_start;
+                                                let remaining = rdb_length - already_read;
+
+                                                println!("Already read {} bytes of RDB, need {} more", already_read, remaining);
+
+                                                // Read the remaining RDB data if needed
+                                                if remaining > 0 {
+                                                    let mut rdb_buf = vec![0u8; remaining];
+                                                    if let Ok(_) = master_stream.read_exact(&mut rdb_buf) {
+                                                        println!("Read remaining {} bytes of RDB file", remaining);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Failed to read PSYNC response: {}", e);
@@ -156,6 +190,9 @@ fn main() {
                                     let request = String::from_utf8_lossy(&buf[..n]);
                                     println!("Received from master: {:?}", request);
 
+                                    // Track if we should count these bytes (don't count REPLCONF GETACK)
+                                    let mut should_count_bytes = true;
+
                                     // Parse and execute commands from master
                                     let commands = parse_commands(&request);
                                     for command in commands {
@@ -164,6 +201,9 @@ fn main() {
                                         // Check if this is REPLCONF GETACK
                                         if let Command::ReplConf(args) = &command {
                                             if args.len() >= 1 && args[0].to_uppercase() == "GETACK" {
+                                                // Don't count REPLCONF GETACK in offset
+                                                should_count_bytes = false;
+
                                                 // Respond with REPLCONF ACK <offset>
                                                 let ack_response = format!(
                                                     "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
@@ -183,7 +223,10 @@ fn main() {
                                     }
 
                                     // Update replication offset with number of bytes processed
-                                    repl_offset += n;
+                                    // (only for write commands, not for REPLCONF GETACK)
+                                    if should_count_bytes {
+                                        repl_offset += n;
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("Error reading from master: {}", e);
