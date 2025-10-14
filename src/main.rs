@@ -123,45 +123,90 @@ fn main() {
                     } else {
                         println!("Sent PSYNC ? -1");
 
-                        // Read PSYNC response (FULLRESYNC)
-                        let mut buf = [0; 1024];
+                        // Read PSYNC response (FULLRESYNC line)
+                        let mut buf = [0; 512];
                         match master_stream.read(&mut buf) {
                             Ok(n) => {
-                                let response = String::from_utf8_lossy(&buf[..n]);
-                                println!("Received PSYNC response (first {} bytes): {:?}", n, &response[..std::cmp::min(100, response.len())]);
+                                let data = &buf[..n];
+                                let response = String::from_utf8_lossy(data);
+                                println!("Received PSYNC response ({} bytes)", n);
 
-                                // The response contains:
-                                // 1. +FULLRESYNC <repl_id> <offset>\r\n
-                                // 2. $<rdb_length>\r\n<rdb_data>
-
-                                // Find where the RDB bulk string starts (after FULLRESYNC line)
+                                // Find where FULLRESYNC ends
                                 if let Some(fullresync_end) = response.find("\r\n") {
+                                    let fullresync_line = &response[..fullresync_end];
+                                    println!("FULLRESYNC: {}", fullresync_line);
+
+                                    // Check if RDB bulk string is in the same read
                                     let after_fullresync = &response[fullresync_end + 2..];
+                                    let mut rdb_length: Option<usize> = None;
+                                    let mut already_read_rdb = 0;
 
-                                    // Parse the RDB bulk string length: $<length>\r\n
-                                    if after_fullresync.starts_with('$') {
-                                        if let Some(rdb_header_end) = after_fullresync.find("\r\n") {
+                                    if let Some(rdb_header_end) = after_fullresync.find("\r\n") {
+                                        if after_fullresync.starts_with('$') {
                                             let length_str = &after_fullresync[1..rdb_header_end];
-                                            if let Ok(rdb_length) = length_str.parse::<usize>() {
-                                                println!("RDB file length: {} bytes", rdb_length);
+                                            if let Ok(len) = length_str.parse::<usize>() {
+                                                rdb_length = Some(len);
+                                                let fullresync_line_len = fullresync_end + 2;
+                                                let rdb_header_len = rdb_header_end + 2;
+                                                let rdb_data_start = fullresync_line_len + rdb_header_len;
+                                                if n > rdb_data_start {
+                                                    already_read_rdb = n - rdb_data_start;
+                                                }
+                                            }
+                                        }
+                                    }
 
-                                                // Calculate how many bytes we've already read
-                                                let rdb_data_start = fullresync_end + 2 + rdb_header_end + 2;
-                                                let already_read = n - rdb_data_start;
-                                                let remaining = rdb_length - already_read;
+                                    // Now read the RDB file (either remainder or all of it)
+                                    if let Some(len) = rdb_length {
+                                        // RDB bulk string header was in first read
+                                        println!("RDB file length: {} bytes (header in first read)", len);
+                                        println!("Already read {} bytes of RDB data", already_read_rdb);
 
-                                                println!("Already read {} bytes of RDB, need {} more", already_read, remaining);
+                                        if already_read_rdb < len {
+                                            let remaining = len - already_read_rdb;
+                                            let mut rdb_buf = vec![0u8; remaining];
+                                            if let Ok(_) = master_stream.read_exact(&mut rdb_buf) {
+                                                println!("Read remaining {} bytes of RDB", remaining);
+                                            }
+                                        }
+                                    } else {
+                                        // RDB bulk string comes in next read
+                                        println!("Waiting for RDB bulk string header...");
+                                        let mut rdb_header_buf = [0; 16];
+                                        if let Ok(n) = master_stream.read(&mut rdb_header_buf) {
+                                            let header = String::from_utf8_lossy(&rdb_header_buf[..n]);
+                                            println!("Received RDB header ({} bytes): {:?}", n, header);
 
-                                                // Read the remaining RDB data if needed
-                                                if remaining > 0 {
-                                                    let mut rdb_buf = vec![0u8; remaining];
-                                                    if let Ok(_) = master_stream.read_exact(&mut rdb_buf) {
-                                                        println!("Read remaining {} bytes of RDB file", remaining);
+                                            if let Some(header_end) = header.find("\r\n") {
+                                                if header.starts_with('$') {
+                                                    let length_str = &header[1..header_end];
+                                                    if let Ok(len) = length_str.parse::<usize>() {
+                                                        println!("RDB file length: {} bytes", len);
+
+                                                        // Check if any RDB data came with the header
+                                                        let header_total_len = header_end + 2;
+                                                        let rdb_data_in_header = if n > header_total_len {
+                                                            n - header_total_len
+                                                        } else {
+                                                            0
+                                                        };
+
+                                                        println!("RDB data with header: {} bytes", rdb_data_in_header);
+
+                                                        // Read the rest of the RDB file
+                                                        if rdb_data_in_header < len {
+                                                            let remaining = len - rdb_data_in_header;
+                                                            let mut rdb_buf = vec![0u8; remaining];
+                                                            if let Ok(_) = master_stream.read_exact(&mut rdb_buf) {
+                                                                println!("Read remaining {} bytes of RDB", remaining);
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+                                    println!("RDB file fully consumed");
                                 }
                             }
                             Err(e) => {
@@ -188,10 +233,7 @@ fn main() {
                                 }
                                 Ok(n) => {
                                     let request = String::from_utf8_lossy(&buf[..n]);
-                                    println!("Received from master: {:?}", request);
-
-                                    // Track if we should count these bytes (don't count REPLCONF GETACK)
-                                    let mut should_count_bytes = true;
+                                    println!("Received from master ({} bytes): {:?}", n, request);
 
                                     // Parse and execute commands from master
                                     let commands = parse_commands(&request);
@@ -201,10 +243,8 @@ fn main() {
                                         // Check if this is REPLCONF GETACK
                                         if let Command::ReplConf(args) = &command {
                                             if args.len() >= 1 && args[0].to_uppercase() == "GETACK" {
-                                                // Don't count REPLCONF GETACK in offset
-                                                should_count_bytes = false;
-
                                                 // Respond with REPLCONF ACK <offset>
+                                                // The offset should be the current offset BEFORE processing this GETACK
                                                 let ack_response = format!(
                                                     "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
                                                     repl_offset.to_string().len(),
@@ -214,7 +254,7 @@ fn main() {
                                                     eprintln!("Failed to send ACK: {}", e);
                                                     break;
                                                 }
-                                                println!("Sent REPLCONF ACK {}", repl_offset);
+                                                println!("Sent REPLCONF ACK {} (before counting {} bytes)", repl_offset, n);
                                             }
                                         } else {
                                             // Execute command but don't send response back to master
@@ -223,10 +263,9 @@ fn main() {
                                     }
 
                                     // Update replication offset with number of bytes processed
-                                    // (only for write commands, not for REPLCONF GETACK)
-                                    if should_count_bytes {
-                                        repl_offset += n;
-                                    }
+                                    // This includes REPLCONF GETACK commands
+                                    repl_offset += n;
+                                    println!("Replication offset now: {}", repl_offset);
                                 }
                                 Err(e) => {
                                     eprintln!("Error reading from master: {}", e);
