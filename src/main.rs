@@ -40,7 +40,7 @@ fn main() {
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).unwrap();
     println!("Listening on port {} as {}", port, role);
-    let pool = ThreadPool::new(4);
+    let pool = ThreadPool::new(10);
     let store = Arc::new(Mutex::new(Store::new()));
     let role = Arc::new(role.to_string());
     let replicas: Arc<Mutex<Vec<ReplicaInfo>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1243,81 +1243,96 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                         let response = format!(":0\r\n");
                         stream.write_all(response.as_bytes())
                     } else {
-                        // Collect expected offsets and send REPLCONF GETACK * to all replicas
-                        let getack_cmd = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+                        // Collect expected offsets and check if all are 0 (no writes yet)
                         let mut expected_offsets = Vec::new();
-                        let mut streams_to_read = Vec::new();
+                        let mut has_any_writes = false;
 
                         for replica_info in replicas_lock.iter() {
                             let offset = *replica_info.offset.lock().unwrap();
                             expected_offsets.push(offset);
-
-                            // Send GETACK command
-                            if let Ok(mut write_stream) = replica_info.stream.try_clone() {
-                                write_stream.write_all(getack_cmd.as_bytes()).ok();
-
-                                // Clone for reading
-                                if let Ok(read_stream) = replica_info.stream.try_clone() {
-                                    read_stream.set_nonblocking(false).ok();
-                                    streams_to_read.push(read_stream);
-                                }
+                            if offset > 0 {
+                                has_any_writes = true;
                             }
                         }
 
-                        drop(replicas_lock);
+                        // If no writes have been propagated, return the replica count immediately
+                        if !has_any_writes {
+                            drop(replicas_lock);
+                            let response = format!(":{}\r\n", replica_count);
+                            stream.write_all(response.as_bytes())
+                        } else {
+                            // Send REPLCONF GETACK * to all replicas
+                            let getack_cmd = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+                            let mut streams_to_read = Vec::new();
 
-                        // Now wait for ACK responses with timeout
-                        let mut ack_count = 0;
+                            for replica_info in replicas_lock.iter() {
+                                // Send GETACK command
+                                if let Ok(mut write_stream) = replica_info.stream.try_clone() {
+                                    write_stream.write_all(getack_cmd.as_bytes()).ok();
 
-                        for (idx, read_stream) in streams_to_read.iter_mut().enumerate() {
-                            let expected_offset = expected_offsets.get(idx).copied().unwrap_or(0);
-                            let elapsed = start.elapsed();
-
-                            if elapsed >= timeout_duration {
-                                break;
-                            }
-
-                            let remaining_timeout = timeout_duration.saturating_sub(elapsed);
-                            if remaining_timeout.is_zero() {
-                                break;
-                            }
-
-                            // Set read timeout
-                            read_stream.set_read_timeout(Some(remaining_timeout)).ok();
-                            let mut buf = [0u8; 512];
-
-                            if let Ok(n) = read_stream.read(&mut buf) {
-                                if n > 0 {
-                                    let response = String::from_utf8_lossy(&buf[..n]);
-                                    // Parse REPLCONF ACK <offset>
-                                    // Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
-                                    let parts: Vec<&str> = response.split("\r\n").collect();
-
-                                    // Look for the offset value (it's after "ACK")
-                                    let mut found_ack = false;
-                                    for part in parts.iter() {
-                                        if found_ack && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
-                                            if let Ok(ack_offset) = part.parse::<usize>() {
-                                                if ack_offset >= expected_offset {
-                                                    ack_count += 1;
-                                                }
-                                                break;
-                                            }
-                                        }
-                                        if *part == "ACK" {
-                                            found_ack = true;
-                                        }
+                                    // Clone for reading
+                                    if let Ok(read_stream) = replica_info.stream.try_clone() {
+                                        read_stream.set_nonblocking(false).ok();
+                                        streams_to_read.push(read_stream);
                                     }
                                 }
                             }
 
-                            if ack_count >= numreplicas {
-                                break;
-                            }
-                        }
+                            drop(replicas_lock);
 
-                        let response = format!(":{}\r\n", ack_count);
-                        stream.write_all(response.as_bytes())
+                            // Now wait for ACK responses with timeout
+                            let mut ack_count = 0;
+
+                            for (idx, read_stream) in streams_to_read.iter_mut().enumerate() {
+                                let expected_offset = expected_offsets.get(idx).copied().unwrap_or(0);
+                                let elapsed = start.elapsed();
+
+                                if elapsed >= timeout_duration {
+                                    break;
+                                }
+
+                                let remaining_timeout = timeout_duration.saturating_sub(elapsed);
+                                if remaining_timeout.is_zero() {
+                                    break;
+                                }
+
+                                // Set read timeout
+                                read_stream.set_read_timeout(Some(remaining_timeout)).ok();
+                                let mut buf = [0u8; 512];
+
+                                if let Ok(n) = read_stream.read(&mut buf) {
+                                    if n > 0 {
+                                        let response = String::from_utf8_lossy(&buf[..n]);
+                                        // Parse REPLCONF ACK <offset>
+                                        // Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
+                                        let parts: Vec<&str> = response.split("\r\n").collect();
+
+                                        // Look for the offset value (it's after "ACK")
+                                        let mut found_ack = false;
+                                        for part in parts.iter() {
+                                            if found_ack && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                                                if let Ok(ack_offset) = part.parse::<usize>() {
+                                                    if ack_offset >= expected_offset {
+                                                        ack_count += 1;
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                            if *part == "ACK" {
+                                                found_ack = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if ack_count >= numreplicas {
+                                    break;
+                                }
+                            }
+
+                            let response = format!(":{}\r\n", ack_count);
+                            stream.write_all(response.as_bytes())
+                        }
                     }
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
