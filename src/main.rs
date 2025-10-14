@@ -43,6 +43,7 @@ fn main() {
     let pool = ThreadPool::new(4);
     let store = Arc::new(Mutex::new(Store::new()));
     let role = Arc::new(role.to_string());
+    let replicas: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
 
     // If in replica mode, initiate handshake with master
     if let Some((master_host, master_port)) = replica_of {
@@ -150,8 +151,9 @@ fn main() {
                 println!("accepted new connection");
                 let store_clone = Arc::clone(&store);
                 let role_clone = Arc::clone(&role);
+                let replicas_clone = Arc::clone(&replicas);
                 pool.execute(move || {
-                    handle_connection(stream, store_clone, role_clone);
+                    handle_connection(stream, store_clone, role_clone, replicas_clone);
                 });
             }
             Err(e) => {
@@ -667,7 +669,7 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<TcpStream>>>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -743,6 +745,14 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 let _ = stream.write_all(b"+QUEUED\r\n");
                 continue;
             }
+
+            // Check if this is a write command (before the command is potentially moved)
+            let is_write = command.is_write_command();
+            let resp_for_replicas = if is_write && role.as_str() == "master" {
+                command.to_resp_array()
+            } else {
+                None
+            };
 
             // Execute command normally if not in transaction
             let result = match command {
@@ -1016,7 +1026,16 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     let empty_rdb = hex::decode("524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2").unwrap();
                     let rdb_response = format!("${}\r\n", empty_rdb.len());
                     stream.write_all(rdb_response.as_bytes()).ok();
-                    stream.write_all(&empty_rdb)
+                    let result = stream.write_all(&empty_rdb);
+
+                    // Save a clone of this stream to the replicas list
+                    if let Ok(replica_stream) = stream.try_clone() {
+                        let mut replicas_lock = replicas.lock().unwrap();
+                        replicas_lock.push(replica_stream);
+                        println!("Added replica connection, total replicas: {}", replicas_lock.len());
+                    }
+
+                    result
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
@@ -1024,6 +1043,20 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     stream.write_all(b"+OK\r\n")
                 }
             };
+
+            // Propagate write commands to replicas if we're a master
+            if let Some(resp) = resp_for_replicas {
+                let mut replicas_lock = replicas.lock().unwrap();
+                let mut valid_replicas = Vec::new();
+
+                for mut replica in replicas_lock.drain(..) {
+                    if replica.write_all(resp.as_bytes()).is_ok() {
+                        valid_replicas.push(replica);
+                    }
+                }
+
+                *replicas_lock = valid_replicas;
+            }
 
             if result.is_err() {
                 break;
@@ -1054,6 +1087,82 @@ enum Command {
     Discard, // Discard transaction
     ReplConf(Vec<String>), // Replication configuration
     PSync(String, String), // replication_id, offset
+}
+
+impl Command {
+    // Check if this is a write command that should be propagated to replicas
+    fn is_write_command(&self) -> bool {
+        matches!(self,
+            Command::Set(_, _, _) |
+            Command::Incr(_) |
+            Command::RPush(_, _) |
+            Command::LPush(_, _) |
+            Command::LPop(_, _) |
+            Command::XAdd(_, _, _)
+        )
+    }
+
+    // Convert command to RESP array format for propagation
+    fn to_resp_array(&self) -> Option<String> {
+        match self {
+            Command::Set(key, value, expiry_ms) => {
+                if let Some(ms) = expiry_ms {
+                    let ms_str = ms.to_string();
+                    let parts = vec!["SET", key.as_str(), value.as_str(), "px", ms_str.as_str()];
+                    Some(encode_resp_array(&parts))
+                } else {
+                    let parts = vec!["SET", key.as_str(), value.as_str()];
+                    Some(encode_resp_array(&parts))
+                }
+            }
+            Command::Incr(key) => {
+                let parts = vec!["INCR", key.as_str()];
+                Some(encode_resp_array(&parts))
+            }
+            Command::RPush(key, values) => {
+                let mut parts = vec!["RPUSH", key.as_str()];
+                for v in values {
+                    parts.push(v.as_str());
+                }
+                Some(encode_resp_array(&parts))
+            }
+            Command::LPush(key, values) => {
+                let mut parts = vec!["LPUSH", key.as_str()];
+                for v in values {
+                    parts.push(v.as_str());
+                }
+                Some(encode_resp_array(&parts))
+            }
+            Command::LPop(key, count) => {
+                if let Some(c) = count {
+                    let count_str = c.to_string();
+                    let parts = vec!["LPOP", key.as_str(), count_str.as_str()];
+                    Some(encode_resp_array(&parts))
+                } else {
+                    let parts = vec!["LPOP", key.as_str()];
+                    Some(encode_resp_array(&parts))
+                }
+            }
+            Command::XAdd(key, id, fields) => {
+                let mut parts = vec!["XADD", key.as_str(), id.as_str()];
+                for (field, value) in fields {
+                    parts.push(field.as_str());
+                    parts.push(value.as_str());
+                }
+                Some(encode_resp_array(&parts))
+            }
+            _ => None,
+        }
+    }
+}
+
+// Helper function to encode a RESP array
+fn encode_resp_array(parts: &[&str]) -> String {
+    let mut result = format!("*{}\r\n", parts.len());
+    for part in parts {
+        result.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+    }
+    result
 }
 
 struct Parser<'a> {
@@ -1366,14 +1475,16 @@ mod tests {
             let pool = ThreadPool::new(10);
             let store = Arc::new(Mutex::new(Store::new()));
             let role = Arc::new("master".to_string());
+            let replicas: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
 
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let store_clone = Arc::clone(&store);
                         let role_clone = Arc::clone(&role);
+                        let replicas_clone = Arc::clone(&replicas);
                         pool.execute(move || {
-                            handle_connection(stream, store_clone, role_clone);
+                            handle_connection(stream, store_clone, role_clone, replicas_clone);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
