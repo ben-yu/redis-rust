@@ -3,7 +3,7 @@ use std::{
     io::{BufReader, Write, prelude::*},
     net::{TcpListener, TcpStream},
     collections::{HashMap, BTreeMap},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
     thread,
     env,
@@ -43,7 +43,7 @@ fn main() {
     let pool = ThreadPool::new(4);
     let store = Arc::new(Mutex::new(Store::new()));
     let role = Arc::new(role.to_string());
-    let replicas: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let replicas: Arc<Mutex<Vec<ReplicaInfo>>> = Arc::new(Mutex::new(Vec::new()));
 
     // If in replica mode, initiate handshake with master
     if let Some((master_host, master_port)) = replica_of {
@@ -305,6 +305,20 @@ enum Value {
     String(String, Option<Instant>), // value, optional expiry
     List(Vec<String>),
     Stream(BTreeMap<String, Vec<(String, String)>>), // stream_id -> [(field, value)]
+}
+
+struct ReplicaInfo {
+    stream: TcpStream,
+    offset: Arc<Mutex<usize>>,
+}
+
+impl ReplicaInfo {
+    fn new(stream: TcpStream) -> Self {
+        ReplicaInfo {
+            stream,
+            offset: Arc::new(Mutex::new(0)),
+        }
+    }
 }
 
 struct Store {
@@ -800,6 +814,10 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // PSYNC responds with FULLRESYNC
             "+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n".to_string()
         }
+        Command::Wait(_, _) => {
+            // WAIT is handled specially in handle_connection
+            ":0\r\n".to_string()
+        }
         Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
@@ -843,7 +861,7 @@ fn execute_command_silently(command: Command, store: &Arc<Mutex<Store>>, _role: 
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<TcpStream>>>) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<ReplicaInfo>>>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -1205,11 +1223,102 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     // Save a clone of this stream to the replicas list
                     if let Ok(replica_stream) = stream.try_clone() {
                         let mut replicas_lock = replicas.lock().unwrap();
-                        replicas_lock.push(replica_stream);
+                        replicas_lock.push(ReplicaInfo::new(replica_stream));
                         println!("Added replica connection, total replicas: {}", replicas_lock.len());
                     }
 
                     result
+                }
+                Command::Wait(numreplicas, timeout) => {
+                    // WAIT command: wait for at least numreplicas to acknowledge writes
+                    let start = Instant::now();
+                    let timeout_duration = Duration::from_millis(timeout);
+
+                    // If there are no replicas, return 0 immediately
+                    let replicas_lock = replicas.lock().unwrap();
+                    let replica_count = replicas_lock.len();
+
+                    if replica_count == 0 {
+                        drop(replicas_lock);
+                        let response = format!(":0\r\n");
+                        stream.write_all(response.as_bytes())
+                    } else {
+                        // Collect expected offsets and send REPLCONF GETACK * to all replicas
+                        let getack_cmd = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+                        let mut expected_offsets = Vec::new();
+                        let mut streams_to_read = Vec::new();
+
+                        for replica_info in replicas_lock.iter() {
+                            let offset = *replica_info.offset.lock().unwrap();
+                            expected_offsets.push(offset);
+
+                            // Send GETACK command
+                            if let Ok(mut write_stream) = replica_info.stream.try_clone() {
+                                write_stream.write_all(getack_cmd.as_bytes()).ok();
+
+                                // Clone for reading
+                                if let Ok(read_stream) = replica_info.stream.try_clone() {
+                                    read_stream.set_nonblocking(false).ok();
+                                    streams_to_read.push(read_stream);
+                                }
+                            }
+                        }
+
+                        drop(replicas_lock);
+
+                        // Now wait for ACK responses with timeout
+                        let mut ack_count = 0;
+
+                        for (idx, read_stream) in streams_to_read.iter_mut().enumerate() {
+                            let expected_offset = expected_offsets.get(idx).copied().unwrap_or(0);
+                            let elapsed = start.elapsed();
+
+                            if elapsed >= timeout_duration {
+                                break;
+                            }
+
+                            let remaining_timeout = timeout_duration.saturating_sub(elapsed);
+                            if remaining_timeout.is_zero() {
+                                break;
+                            }
+
+                            // Set read timeout
+                            read_stream.set_read_timeout(Some(remaining_timeout)).ok();
+                            let mut buf = [0u8; 512];
+
+                            if let Ok(n) = read_stream.read(&mut buf) {
+                                if n > 0 {
+                                    let response = String::from_utf8_lossy(&buf[..n]);
+                                    // Parse REPLCONF ACK <offset>
+                                    // Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
+                                    let parts: Vec<&str> = response.split("\r\n").collect();
+
+                                    // Look for the offset value (it's after "ACK")
+                                    let mut found_ack = false;
+                                    for part in parts.iter() {
+                                        if found_ack && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                                            if let Ok(ack_offset) = part.parse::<usize>() {
+                                                if ack_offset >= expected_offset {
+                                                    ack_count += 1;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        if *part == "ACK" {
+                                            found_ack = true;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if ack_count >= numreplicas {
+                                break;
+                            }
+                        }
+
+                        let response = format!(":{}\r\n", ack_count);
+                        stream.write_all(response.as_bytes())
+                    }
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
@@ -1223,9 +1332,13 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 let mut replicas_lock = replicas.lock().unwrap();
                 let mut valid_replicas = Vec::new();
 
-                for mut replica in replicas_lock.drain(..) {
-                    if replica.write_all(resp.as_bytes()).is_ok() {
-                        valid_replicas.push(replica);
+                for mut replica_info in replicas_lock.drain(..) {
+                    if replica_info.stream.write_all(resp.as_bytes()).is_ok() {
+                        // Update the expected offset for this replica
+                        let mut offset = replica_info.offset.lock().unwrap();
+                        *offset += resp.len();
+                        drop(offset);
+                        valid_replicas.push(replica_info);
                     }
                 }
 
@@ -1262,6 +1375,7 @@ enum Command {
     Discard, // Discard transaction
     ReplConf(Vec<String>), // Replication configuration
     PSync(String, String), // replication_id, offset
+    Wait(usize, u64), // numreplicas, timeout in milliseconds
 }
 
 impl Command {
@@ -1462,6 +1576,11 @@ impl<'a> Parser<'a> {
                 let offset = self.read_bulk_string()?;
                 Some(Command::PSync(repl_id, offset))
             }
+            "WAIT" => {
+                let numreplicas = self.read_bulk_string()?.parse::<usize>().ok()?;
+                let timeout = self.read_bulk_string()?.parse::<u64>().ok()?;
+                Some(Command::Wait(numreplicas, timeout))
+            }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
                 let mut values = Vec::new();
@@ -1650,7 +1769,7 @@ mod tests {
             let pool = ThreadPool::new(10);
             let store = Arc::new(Mutex::new(Store::new()));
             let role = Arc::new("master".to_string());
-            let replicas: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+            let replicas: Arc<Mutex<Vec<ReplicaInfo>>> = Arc::new(Mutex::new(Vec::new()));
 
             loop {
                 match listener.accept() {
