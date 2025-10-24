@@ -2,7 +2,7 @@
 use std::{
     io::{BufReader, Write, prelude::*},
     net::{TcpListener, TcpStream},
-    collections::{HashMap, BTreeMap},
+    collections::{HashMap, BTreeMap, HashSet},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
     thread,
@@ -15,6 +15,8 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let mut port = 6379; // Default port
     let mut replica_of: Option<(String, u16)> = None; // (host, port)
+    let mut dir = "/tmp/redis-files".to_string(); // Default directory
+    let mut dbfilename = "dump.rdb".to_string(); // Default db filename
 
     let mut i = 1;
     while i < args.len() {
@@ -31,6 +33,12 @@ fn main() {
                 replica_of = Some((host, master_port));
             }
             i += 2;
+        } else if args[i] == "--dir" && i + 1 < args.len() {
+            dir = args[i + 1].clone();
+            i += 2;
+        } else if args[i] == "--dbfilename" && i + 1 < args.len() {
+            dbfilename = args[i + 1].clone();
+            i += 2;
         } else {
             i += 1;
         }
@@ -44,6 +52,9 @@ fn main() {
     let store = Arc::new(Mutex::new(Store::new()));
     let role = Arc::new(role.to_string());
     let replicas: Arc<Mutex<Vec<ReplicaInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let config_dir = Arc::new(dir);
+    let config_dbfilename = Arc::new(dbfilename);
+    let pubsub = Arc::new(Mutex::new(PubSub::new()));
 
     // If in replica mode, initiate handshake with master
     if let Some((master_host, master_port)) = replica_of {
@@ -290,8 +301,11 @@ fn main() {
                 let store_clone = Arc::clone(&store);
                 let role_clone = Arc::clone(&role);
                 let replicas_clone = Arc::clone(&replicas);
+                let dir_clone = Arc::clone(&config_dir);
+                let dbfilename_clone = Arc::clone(&config_dbfilename);
+                let pubsub_clone = Arc::clone(&pubsub);
                 pool.execute(move || {
-                    handle_connection(stream, store_clone, role_clone, replicas_clone);
+                    handle_connection(stream, store_clone, role_clone, replicas_clone, dir_clone, dbfilename_clone, pubsub_clone);
                 });
             }
             Err(e) => {
@@ -318,6 +332,56 @@ impl ReplicaInfo {
             stream,
             offset: Arc::new(Mutex::new(0)),
         }
+    }
+}
+
+// PubSub system to track channel subscribers
+struct PubSub {
+    // Map of channel name to list of subscriber senders
+    channels: HashMap<String, Vec<mpsc::Sender<String>>>,
+}
+
+impl PubSub {
+    fn new() -> Self {
+        PubSub {
+            channels: HashMap::new(),
+        }
+    }
+
+    fn subscribe(&mut self, channel: String, sender: mpsc::Sender<String>) {
+        self.channels
+            .entry(channel)
+            .or_insert_with(Vec::new)
+            .push(sender);
+    }
+
+    fn unsubscribe(&mut self, channel: &str, sender_id: usize) {
+        if let Some(senders) = self.channels.get_mut(channel) {
+            if sender_id < senders.len() {
+                senders.remove(sender_id);
+            }
+            if senders.is_empty() {
+                self.channels.remove(channel);
+            }
+        }
+    }
+
+    fn publish(&self, channel: &str, message: &str) -> usize {
+        if let Some(senders) = self.channels.get(channel) {
+            let mut count = 0;
+            for sender in senders {
+                if sender.send(message.to_string()).is_ok() {
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    fn subscriber_count(&self, channel: &str) -> usize {
+        self.channels.get(channel).map_or(0, |s| s.len())
     }
 }
 
@@ -818,6 +882,14 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // WAIT is handled specially in handle_connection
             ":0\r\n".to_string()
         }
+        Command::Config(_, _) => {
+            // CONFIG is handled specially in handle_connection with access to config values
+            "*0\r\n".to_string()
+        }
+        Command::Subscribe(_) => {
+            // SUBSCRIBE is handled specially in handle_connection with pubsub access
+            "+OK\r\n".to_string()
+        }
         Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
@@ -861,7 +933,7 @@ fn execute_command_silently(command: Command, store: &Arc<Mutex<Store>>, _role: 
     }
 }
 
-fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<ReplicaInfo>>>) {
+fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<ReplicaInfo>>>, config_dir: Arc<String>, config_dbfilename: Arc<String>, pubsub: Arc<Mutex<PubSub>>) {
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -1335,6 +1407,79 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                         }
                     }
                 }
+                Command::Config(subcommand, parameter) => {
+                    // CONFIG GET command
+                    if subcommand.to_uppercase() == "GET" {
+                        let param_lower = parameter.to_lowercase();
+                        let response = match param_lower.as_str() {
+                            "dir" => {
+                                // Return as RESP array: *2\r\n$3\r\ndir\r\n$<len>\r\n<value>\r\n
+                                format!("*2\r\n$3\r\ndir\r\n${}\r\n{}\r\n", config_dir.len(), config_dir.as_str())
+                            }
+                            "dbfilename" => {
+                                // Return as RESP array: *2\r\n$10\r\ndbfilename\r\n$<len>\r\n<value>\r\n
+                                format!("*2\r\n$10\r\ndbfilename\r\n${}\r\n{}\r\n", config_dbfilename.len(), config_dbfilename.as_str())
+                            }
+                            _ => {
+                                // Unknown parameter, return empty array
+                                "*0\r\n".to_string()
+                            }
+                        };
+                        stream.write_all(response.as_bytes())
+                    } else {
+                        // Only GET is supported
+                        stream.write_all(b"-ERR Unknown CONFIG subcommand\r\n")
+                    }
+                }
+                Command::Subscribe(channels) => {
+                    // SUBSCRIBE command - register client to channels
+                    // Create a channel for receiving published messages
+                    let (tx, rx) = mpsc::channel::<String>();
+
+                    // Subscribe to each channel
+                    let mut pubsub_lock = pubsub.lock().unwrap();
+                    let mut subscription_count = 0;
+
+                    for channel in &channels {
+                        pubsub_lock.subscribe(channel.clone(), tx.clone());
+                        subscription_count += 1;
+
+                        // Send subscription confirmation for each channel
+                        // Format: *3\r\n$9\r\nsubscribe\r\n$<channel_len>\r\n<channel>\r\n:<count>\r\n
+                        let response = format!(
+                            "*3\r\n$9\r\nsubscribe\r\n${}\r\n{}\r\n:{}\r\n",
+                            channel.len(),
+                            channel,
+                            subscription_count
+                        );
+                        stream.write_all(response.as_bytes()).ok();
+                    }
+
+                    drop(pubsub_lock);
+
+                    // Now enter subscriber mode - keep reading from the channel
+                    // This blocks the connection and keeps it open for receiving messages
+                    loop {
+                        match rx.recv() {
+                            Ok(message) => {
+                                // Send published message to subscriber
+                                // Format: *3\r\n$7\r\nmessage\r\n$<channel_len>\r\n<channel>\r\n$<msg_len>\r\n<message>\r\n
+                                // Note: We need to know which channel the message came from
+                                // For now, we'll just send the message
+                                let response = format!("${}\\r\\n{}\\r\\n", message.len(), message);
+                                if stream.write_all(response.as_bytes()).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                // Channel closed, exit subscriber mode
+                                break;
+                            }
+                        }
+                    }
+
+                    Ok(())
+                }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
                     // This case is unreachable but needed for exhaustiveness
@@ -1391,6 +1536,8 @@ enum Command {
     ReplConf(Vec<String>), // Replication configuration
     PSync(String, String), // replication_id, offset
     Wait(usize, u64), // numreplicas, timeout in milliseconds
+    Config(String, String), // subcommand (GET/SET), parameter
+    Subscribe(Vec<String>), // channels to subscribe to
 }
 
 impl Command {
@@ -1596,6 +1743,22 @@ impl<'a> Parser<'a> {
                 let timeout = self.read_bulk_string()?.parse::<u64>().ok()?;
                 Some(Command::Wait(numreplicas, timeout))
             }
+            "CONFIG" => {
+                let subcommand = self.read_bulk_string()?;
+                let parameter = self.read_bulk_string()?;
+                Some(Command::Config(subcommand, parameter))
+            }
+            "SUBSCRIBE" => {
+                let mut channels = Vec::new();
+                while let Some(channel) = self.read_bulk_string() {
+                    channels.push(channel);
+                }
+                if channels.is_empty() {
+                    None
+                } else {
+                    Some(Command::Subscribe(channels))
+                }
+            }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
                 let mut values = Vec::new();
@@ -1792,8 +1955,11 @@ mod tests {
                         let store_clone = Arc::clone(&store);
                         let role_clone = Arc::clone(&role);
                         let replicas_clone = Arc::clone(&replicas);
+                        let dir_clone = Arc::clone(&config_dir);
+                        let dbfilename_clone = Arc::clone(&config_dbfilename);
+                        let pubsub_clone = Arc::clone(&pubsub);
                         pool.execute(move || {
-                            handle_connection(stream, store_clone, role_clone, replicas_clone);
+                            handle_connection(stream, store_clone, role_clone, replicas_clone, dir_clone, dbfilename_clone, pubsub_clone);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
