@@ -336,9 +336,10 @@ impl ReplicaInfo {
 }
 
 // PubSub system to track channel subscribers
+// Messages are sent as (channel_name, message_content)
 struct PubSub {
     // Map of channel name to list of subscriber senders
-    channels: HashMap<String, Vec<mpsc::Sender<String>>>,
+    channels: HashMap<String, Vec<mpsc::Sender<(String, String)>>>,
 }
 
 impl PubSub {
@@ -348,7 +349,7 @@ impl PubSub {
         }
     }
 
-    fn subscribe(&mut self, channel: String, sender: mpsc::Sender<String>) {
+    fn subscribe(&mut self, channel: String, sender: mpsc::Sender<(String, String)>) {
         self.channels
             .entry(channel)
             .or_insert_with(Vec::new)
@@ -370,7 +371,7 @@ impl PubSub {
         if let Some(senders) = self.channels.get(channel) {
             let mut count = 0;
             for sender in senders {
-                if sender.send(message.to_string()).is_ok() {
+                if sender.send((channel.to_string(), message.to_string())).is_ok() {
                     count += 1;
                 }
             }
@@ -938,7 +939,40 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
 
+    // Track subscription state for this connection
+    let mut subscribed_channels: HashSet<String> = HashSet::new();
+    let mut subscription_rx: Option<mpsc::Receiver<(String, String)>> = None;
+    let mut subscription_tx: Option<mpsc::Sender<(String, String)>> = None;
+
     loop {
+        // Check for published messages if subscribed
+        if let Some(ref rx) = subscription_rx {
+            match rx.try_recv() {
+                Ok((channel, message)) => {
+                    // Send published message to subscriber
+                    // Format: *3\r\n$7\r\nmessage\r\n$<channel_len>\r\n<channel>\r\n$<msg_len>\r\n<message>\r\n
+                    let response = format!(
+                        "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                        channel.len(),
+                        channel,
+                        message.len(),
+                        message
+                    );
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        break;
+                    }
+                    continue; // Check for more messages
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // No messages, continue to read commands
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed
+                    break;
+                }
+            }
+        }
+
         let bytes_read = match stream.read(&mut buf) {
             Ok(0) => break, // Connection closed
             Ok(n) => n,
@@ -1433,16 +1467,23 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 }
                 Command::Subscribe(channels) => {
                     // SUBSCRIBE command - register client to channels
-                    // Create a channel for receiving published messages
-                    let (tx, rx) = mpsc::channel::<String>();
+                    // Create a channel for receiving published messages if not already created
+                    if subscription_tx.is_none() {
+                        let (tx, rx) = mpsc::channel::<(String, String)>();
+                        subscription_tx = Some(tx);
+                        subscription_rx = Some(rx);
+                    }
+
+                    let tx = subscription_tx.as_ref().unwrap();
 
                     // Subscribe to each channel
                     let mut pubsub_lock = pubsub.lock().unwrap();
-                    let mut subscription_count = 0;
 
                     for channel in &channels {
-                        pubsub_lock.subscribe(channel.clone(), tx.clone());
-                        subscription_count += 1;
+                        if !subscribed_channels.contains(channel) {
+                            pubsub_lock.subscribe(channel.clone(), tx.clone());
+                            subscribed_channels.insert(channel.clone());
+                        }
 
                         // Send subscription confirmation for each channel
                         // Format: *3\r\n$9\r\nsubscribe\r\n$<channel_len>\r\n<channel>\r\n:<count>\r\n
@@ -1450,34 +1491,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                             "*3\r\n$9\r\nsubscribe\r\n${}\r\n{}\r\n:{}\r\n",
                             channel.len(),
                             channel,
-                            subscription_count
+                            subscribed_channels.len()
                         );
                         stream.write_all(response.as_bytes()).ok();
                     }
 
                     drop(pubsub_lock);
-
-                    // Now enter subscriber mode - keep reading from the channel
-                    // This blocks the connection and keeps it open for receiving messages
-                    loop {
-                        match rx.recv() {
-                            Ok(message) => {
-                                // Send published message to subscriber
-                                // Format: *3\r\n$7\r\nmessage\r\n$<channel_len>\r\n<channel>\r\n$<msg_len>\r\n<message>\r\n
-                                // Note: We need to know which channel the message came from
-                                // For now, we'll just send the message
-                                let response = format!("${}\\r\\n{}\\r\\n", message.len(), message);
-                                if stream.write_all(response.as_bytes()).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                // Channel closed, exit subscriber mode
-                                break;
-                            }
-                        }
-                    }
-
                     Ok(())
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
