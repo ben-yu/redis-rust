@@ -338,29 +338,35 @@ impl ReplicaInfo {
 // PubSub system to track channel subscribers
 // Messages are sent as (channel_name, message_content)
 struct PubSub {
-    // Map of channel name to list of subscriber senders
-    channels: HashMap<String, Vec<mpsc::Sender<(String, String)>>>,
+    // Map of channel name to list of (connection_id, subscriber sender) pairs
+    channels: HashMap<String, Vec<(usize, mpsc::Sender<(String, String)>)>>,
+    next_connection_id: usize,
 }
 
 impl PubSub {
     fn new() -> Self {
         PubSub {
             channels: HashMap::new(),
+            next_connection_id: 0,
         }
     }
 
-    fn subscribe(&mut self, channel: String, sender: mpsc::Sender<(String, String)>) {
+    fn generate_connection_id(&mut self) -> usize {
+        let id = self.next_connection_id;
+        self.next_connection_id += 1;
+        id
+    }
+
+    fn subscribe(&mut self, channel: String, connection_id: usize, sender: mpsc::Sender<(String, String)>) {
         self.channels
             .entry(channel)
             .or_insert_with(Vec::new)
-            .push(sender);
+            .push((connection_id, sender));
     }
 
-    fn unsubscribe(&mut self, channel: &str, sender_id: usize) {
+    fn unsubscribe(&mut self, channel: &str, connection_id: usize) {
         if let Some(senders) = self.channels.get_mut(channel) {
-            if sender_id < senders.len() {
-                senders.remove(sender_id);
-            }
+            senders.retain(|(id, _)| *id != connection_id);
             if senders.is_empty() {
                 self.channels.remove(channel);
             }
@@ -370,7 +376,7 @@ impl PubSub {
     fn publish(&self, channel: &str, message: &str) -> usize {
         if let Some(senders) = self.channels.get(channel) {
             let mut count = 0;
-            for sender in senders {
+            for (_id, sender) in senders {
                 if sender.send((channel.to_string(), message.to_string())).is_ok() {
                     count += 1;
                 }
@@ -950,6 +956,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
     // Set stream to non-blocking mode for pub/sub support
     stream.set_nonblocking(true).ok();
 
+    // Get a unique connection ID for this connection
+    let connection_id = {
+        let mut pubsub_lock = pubsub.lock().unwrap();
+        pubsub_lock.generate_connection_id()
+    };
+
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -965,17 +977,20 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
         if let Some(ref rx) = subscription_rx {
             match rx.try_recv() {
                 Ok((channel, message)) => {
-                    // Send published message to subscriber
-                    // Format: *3\r\n$7\r\nmessage\r\n$<channel_len>\r\n<channel>\r\n$<msg_len>\r\n<message>\r\n
-                    let response = format!(
-                        "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                        channel.len(),
-                        channel,
-                        message.len(),
-                        message
-                    );
-                    if stream.write_all(response.as_bytes()).is_err() {
-                        break;
+                    // Only forward messages for channels we're still subscribed to
+                    if subscribed_channels.contains(&channel) {
+                        // Send published message to subscriber
+                        // Format: *3\r\n$7\r\nmessage\r\n$<channel_len>\r\n<channel>\r\n$<msg_len>\r\n<message>\r\n
+                        let response = format!(
+                            "*3\r\n$7\r\nmessage\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                            channel.len(),
+                            channel,
+                            message.len(),
+                            message
+                        );
+                        if stream.write_all(response.as_bytes()).is_err() {
+                            break;
+                        }
                     }
                     continue; // Check for more messages
                 }
@@ -1532,7 +1547,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
 
                     for channel in &channels {
                         if !subscribed_channels.contains(channel) {
-                            pubsub_lock.subscribe(channel.clone(), tx.clone());
+                            pubsub_lock.subscribe(channel.clone(), connection_id, tx.clone());
                             subscribed_channels.insert(channel.clone());
                         }
 
@@ -1552,15 +1567,42 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 }
                 Command::Unsubscribe(channels) => {
                     // UNSUBSCRIBE command - remove client from channels
+                    let mut pubsub_lock = pubsub.lock().unwrap();
+
                     if channels.is_empty() {
                         // Unsubscribe from all channels
-                        subscribed_channels.clear();
-                        let response = format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
-                        stream.write_all(response.as_bytes())
+                        let channels_to_unsub: Vec<String> = subscribed_channels.iter().cloned().collect();
+
+                        if channels_to_unsub.is_empty() {
+                            // Not subscribed to any channels
+                            let response = format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
+                            stream.write_all(response.as_bytes()).ok();
+                        } else {
+                            // Send response for each channel being unsubscribed
+                            for channel in &channels_to_unsub {
+                                subscribed_channels.remove(channel);
+                                pubsub_lock.unsubscribe(channel, connection_id);
+                                let response = format!(
+                                    "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:{}\r\n",
+                                    channel.len(),
+                                    channel,
+                                    subscribed_channels.len()
+                                );
+                                stream.write_all(response.as_bytes()).ok();
+                            }
+                        }
+
+                        // Exit subscribe mode if no channels left
+                        if subscribed_channels.is_empty() {
+                            in_subscribe_mode = false;
+                        }
+                        drop(pubsub_lock);
+                        Ok(())
                     } else {
                         // Unsubscribe from specific channels
                         for channel in &channels {
                             subscribed_channels.remove(channel);
+                            pubsub_lock.unsubscribe(channel, connection_id);
                             let response = format!(
                                 "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:{}\r\n",
                                 channel.len(),
@@ -1569,6 +1611,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                             );
                             stream.write_all(response.as_bytes()).ok();
                         }
+
+                        // Exit subscribe mode if no channels left
+                        if subscribed_channels.is_empty() {
+                            in_subscribe_mode = false;
+                        }
+                        drop(pubsub_lock);
                         Ok(())
                     }
                 }
