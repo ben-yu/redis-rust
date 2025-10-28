@@ -246,10 +246,10 @@ fn main() {
                                     let request = String::from_utf8_lossy(&buf[..n]);
                                     println!("Received from master ({} bytes): {:?}", n, request);
 
-                                    // Parse and execute commands from master
-                                    let commands = parse_commands(&request);
-                                    for command in commands {
-                                        println!("Executing command from master: {:?}", command);
+                                    // Parse commands with their byte sizes
+                                    let commands_with_sizes = parse_commands_with_sizes(&request);
+                                    for (command, cmd_size) in commands_with_sizes {
+                                        println!("Executing command from master: {:?} (size: {} bytes)", command, cmd_size);
 
                                         // Check if this is REPLCONF GETACK
                                         if let Command::ReplConf(args) = &command {
@@ -265,18 +265,17 @@ fn main() {
                                                     eprintln!("Failed to send ACK: {}", e);
                                                     break;
                                                 }
-                                                println!("Sent REPLCONF ACK {} (before counting {} bytes)", repl_offset, n);
+                                                println!("Sent REPLCONF ACK {} (before adding {} bytes from this GETACK)", repl_offset, cmd_size);
                                             }
                                         } else {
                                             // Execute command but don't send response back to master
                                             execute_command_silently(command, &store_for_replication, role_for_replication.as_str());
                                         }
-                                    }
 
-                                    // Update replication offset with number of bytes processed
-                                    // This includes REPLCONF GETACK commands
-                                    repl_offset += n;
-                                    println!("Replication offset now: {}", repl_offset);
+                                        // Update replication offset after processing each command
+                                        repl_offset += cmd_size;
+                                        println!("Replication offset now: {}", repl_offset);
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("Error reading from master: {}", e);
@@ -972,7 +971,16 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
     let mut subscription_rx: Option<mpsc::Receiver<(String, String)>> = None;
     let mut subscription_tx: Option<mpsc::Sender<(String, String)>> = None;
 
+    // Track if this connection is now a replica (after PSYNC)
+    let mut is_replica_connection = false;
+
     loop {
+        // If this is a replica connection, don't try to read commands
+        // The replica stream in the replicas list is used for communication
+        if is_replica_connection {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
         // Check for published messages if subscribed
         if let Some(ref rx) = subscription_rx {
             match rx.try_recv() {
@@ -1396,6 +1404,10 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                         println!("Added replica connection, total replicas: {}", replicas_lock.len());
                     }
 
+                    // Mark this connection as a replica so we stop reading from it
+                    // The cloned stream in the replicas list will be used for all communication
+                    is_replica_connection = true;
+
                     result
                 }
                 Command::Wait(numreplicas, timeout) => {
@@ -1435,14 +1447,17 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                             let mut streams_to_read = Vec::new();
 
                             for replica_info in replicas_lock.iter() {
-                                // Send GETACK command
-                                if let Ok(mut write_stream) = replica_info.stream.try_clone() {
-                                    write_stream.write_all(getack_cmd.as_bytes()).ok();
+                                // Clone the stream once for this WAIT operation
+                                if let Ok(mut replica_stream) = replica_info.stream.try_clone() {
+                                    // Ensure the stream is in blocking mode
+                                    if replica_stream.set_nonblocking(false).is_err() {
+                                        println!("[WAIT] Warning: Failed to set stream to blocking mode");
+                                        continue;
+                                    }
 
-                                    // Clone for reading
-                                    if let Ok(read_stream) = replica_info.stream.try_clone() {
-                                        read_stream.set_nonblocking(false).ok();
-                                        streams_to_read.push(read_stream);
+                                    // Send GETACK command through this stream
+                                    if replica_stream.write_all(getack_cmd.as_bytes()).is_ok() {
+                                        streams_to_read.push(replica_stream);
                                     }
                                 }
                             }
@@ -1454,47 +1469,90 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
 
                             for (idx, read_stream) in streams_to_read.iter_mut().enumerate() {
                                 let expected_offset = expected_offsets.get(idx).copied().unwrap_or(0);
+                                println!("[WAIT] Checking replica {}, expected_offset: {}", idx, expected_offset);
                                 let elapsed = start.elapsed();
 
                                 if elapsed >= timeout_duration {
+                                    println!("[WAIT] Timeout elapsed, breaking");
                                     break;
                                 }
 
                                 let remaining_timeout = timeout_duration.saturating_sub(elapsed);
                                 if remaining_timeout.is_zero() {
+                                    println!("[WAIT] Remaining timeout is zero, breaking");
                                     break;
                                 }
 
-                                // Set read timeout
-                                read_stream.set_read_timeout(Some(remaining_timeout)).ok();
-                                let mut buf = [0u8; 512];
+                                // Set read timeout - ensure this succeeds
+                                if read_stream.set_read_timeout(Some(remaining_timeout)).is_err() {
+                                    println!("[WAIT] Warning: Failed to set read timeout for replica {}", idx);
+                                }
 
-                                if let Ok(n) = read_stream.read(&mut buf) {
-                                    if n > 0 {
-                                        let response = String::from_utf8_lossy(&buf[..n]);
-                                        // Parse REPLCONF ACK <offset>
-                                        // Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
-                                        let parts: Vec<&str> = response.split("\r\n").collect();
+                                // Retry loop to handle WouldBlock errors
+                                let retry_deadline = Instant::now() + remaining_timeout;
+                                let mut last_error = None;
 
-                                        // Look for the offset value (it's after "ACK")
-                                        let mut found_ack = false;
-                                        for part in parts.iter() {
-                                            if found_ack && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
-                                                if let Ok(ack_offset) = part.parse::<usize>() {
-                                                    if ack_offset >= expected_offset {
-                                                        ack_count += 1;
+                                loop {
+                                    let mut buf = [0u8; 512];
+                                    match read_stream.read(&mut buf) {
+                                        Ok(n) => {
+                                            println!("[WAIT] Read {} bytes from replica {}", n, idx);
+                                            if n > 0 {
+                                                let response = String::from_utf8_lossy(&buf[..n]);
+                                                println!("[WAIT] Response: {:?}", response);
+                                                // Parse REPLCONF ACK <offset>
+                                                // Format: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
+                                                let parts: Vec<&str> = response.split("\r\n").collect();
+
+                                                // Look for the offset value (it's after "ACK")
+                                                let mut found_ack = false;
+                                                for part in parts.iter() {
+                                                    if found_ack && !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
+                                                        if let Ok(ack_offset) = part.parse::<usize>() {
+                                                            println!("[WAIT] Parsed ack_offset: {}, expected: {}", ack_offset, expected_offset);
+                                                            if ack_offset >= expected_offset {
+                                                                ack_count += 1;
+                                                                println!("[WAIT] Replica {} acknowledged! ack_count now: {}", idx, ack_count);
+                                                            } else {
+                                                                println!("[WAIT] Replica {} ack_offset {} < expected {}", idx, ack_offset, expected_offset);
+                                                            }
+                                                            break;
+                                                        }
                                                     }
-                                                    break;
+                                                    if *part == "ACK" {
+                                                        found_ack = true;
+                                                    }
                                                 }
                                             }
-                                            if *part == "ACK" {
-                                                found_ack = true;
+                                            break; // Successfully read data
+                                        }
+                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            // Stream is in non-blocking mode or data not available yet
+                                            println!("[WAIT] WouldBlock error from replica {}, retrying...", idx);
+                                            if Instant::now() >= retry_deadline {
+                                                println!("[WAIT] Retry timeout exceeded for replica {}", idx);
+                                                last_error = Some(e);
+                                                break;
                                             }
+                                            // Try to force blocking mode again
+                                            read_stream.set_nonblocking(false).ok();
+                                            std::thread::sleep(Duration::from_millis(10));
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            println!("[WAIT] Error reading from replica {}: {}", idx, e);
+                                            last_error = Some(e);
+                                            break;
                                         }
                                     }
                                 }
 
+                                if let Some(e) = last_error {
+                                    println!("[WAIT] Failed to read from replica {} after retries: {}", idx, e);
+                                }
+
                                 if ack_count >= numreplicas {
+                                    println!("[WAIT] Reached required ack_count {}, breaking", ack_count);
                                     break;
                                 }
                             }
@@ -2164,6 +2222,38 @@ fn parse_commands(request: &str) -> Vec<Command> {
     }
 
     commands
+}
+
+// Parse commands and return them with their byte sizes in the original request
+fn parse_commands_with_sizes(request: &str) -> Vec<(Command, usize)> {
+    let mut parser = Parser::new(request);
+    let mut commands_with_sizes = Vec::new();
+    let bytes = request.as_bytes();
+    let mut byte_offset = 0;
+
+    while parser.index < parser.lines.len() {
+        let start_index = parser.index;
+        if let Some(command) = parser.parse_command() {
+            // Calculate how many bytes this command consumed
+            let end_index = parser.index;
+
+            // Count bytes from start_index to end_index in the original request
+            let mut cmd_bytes = 0;
+            for i in start_index..end_index {
+                if i < parser.lines.len() {
+                    // Each line includes its content + \r\n
+                    cmd_bytes += parser.lines[i].len() + 2;
+                }
+            }
+
+            commands_with_sizes.push((command, cmd_bytes));
+            byte_offset += cmd_bytes;
+        } else {
+            parser.advance();
+        }
+    }
+
+    commands_with_sizes
 }
 
 #[cfg(test)]
