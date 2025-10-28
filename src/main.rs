@@ -947,6 +947,9 @@ fn execute_command_silently(command: Command, store: &Arc<Mutex<Store>>, _role: 
 }
 
 fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<String>, replicas: Arc<Mutex<Vec<ReplicaInfo>>>, config_dir: Arc<String>, config_dbfilename: Arc<String>, pubsub: Arc<Mutex<PubSub>>) {
+    // Set stream to non-blocking mode for pub/sub support
+    stream.set_nonblocking(true).ok();
+
     let mut buf = [0; 512];
     let mut in_transaction = false;
     let mut queued_commands: Vec<Command> = Vec::new();
@@ -989,7 +992,12 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
         let bytes_read = match stream.read(&mut buf) {
             Ok(0) => break, // Connection closed
             Ok(n) => n,
-            Err(_) => break, // Error reading
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available, sleep briefly and check for messages again
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => break, // Other error
         };
 
         let request = String::from_utf8_lossy(&buf[..bytes_read]);
