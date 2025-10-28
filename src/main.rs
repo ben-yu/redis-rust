@@ -1085,7 +1085,13 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
             // Execute command normally if not in transaction
             let result = match command {
                 Command::Ping => {
-                    stream.write_all(b"+PONG\r\n")
+                    if in_subscribe_mode {
+                        // In subscribe mode, PING responds with a RESP array
+                        // *2\r\n$4\r\npong\r\n$0\r\n\r\n
+                        stream.write_all(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n")
+                    } else {
+                        stream.write_all(b"+PONG\r\n")
+                    }
                 }
                 Command::Echo(msg) => {
                     let response = format!("${}\r\n{}\r\n", msg.len(), msg);
