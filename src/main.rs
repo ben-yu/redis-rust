@@ -895,6 +895,10 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // Handled specially in handle_connection
             "+OK\r\n".to_string()
         }
+        Command::Publish(_, _) => {
+            // PUBLISH is handled specially in handle_connection with pubsub access
+            ":0\r\n".to_string()
+        }
         Command::Quit => {
             // QUIT is handled specially in handle_connection
             "+OK\r\n".to_string()
@@ -1569,6 +1573,16 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                     // Pattern-based unsubscribe (simplified - just acknowledge)
                     stream.write_all(b"+OK\r\n")
                 }
+                Command::Publish(channel, message) => {
+                    // PUBLISH command - send message to all subscribers of the channel
+                    let pubsub_lock = pubsub.lock().unwrap();
+                    let count = pubsub_lock.publish(&channel, &message);
+                    drop(pubsub_lock);
+
+                    // Return the number of clients that received the message
+                    let response = format!(":{}\r\n", count);
+                    stream.write_all(response.as_bytes())
+                }
                 Command::Quit => {
                     // QUIT - close connection gracefully
                     stream.write_all(b"+OK\r\n").ok();
@@ -1635,6 +1649,7 @@ enum Command {
     Unsubscribe(Vec<String>), // channels to unsubscribe from (empty = all)
     PSubscribe(Vec<String>), // pattern-based subscribe
     PUnsubscribe(Vec<String>), // pattern-based unsubscribe
+    Publish(String, String), // channel, message
     Quit, // Close the connection
 }
 
@@ -1669,6 +1684,7 @@ impl Command {
             Command::Unsubscribe(_) => "unsubscribe",
             Command::PSubscribe(_) => "psubscribe",
             Command::PUnsubscribe(_) => "punsubscribe",
+            Command::Publish(_, _) => "publish",
             Command::Quit => "quit",
         }
     }
@@ -1915,6 +1931,11 @@ impl<'a> Parser<'a> {
                     patterns.push(pattern);
                 }
                 Some(Command::PUnsubscribe(patterns))
+            }
+            "PUBLISH" => {
+                let channel = self.read_bulk_string()?;
+                let message = self.read_bulk_string()?;
+                Some(Command::Publish(channel, message))
             }
             "QUIT" => {
                 Some(Command::Quit)
