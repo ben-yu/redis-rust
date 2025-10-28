@@ -891,6 +891,14 @@ fn execute_command_to_string(command: Command, store: &Arc<Mutex<Store>>, role: 
             // SUBSCRIBE is handled specially in handle_connection with pubsub access
             "+OK\r\n".to_string()
         }
+        Command::Unsubscribe(_) | Command::PSubscribe(_) | Command::PUnsubscribe(_) => {
+            // Handled specially in handle_connection
+            "+OK\r\n".to_string()
+        }
+        Command::Quit => {
+            // QUIT is handled specially in handle_connection
+            "+OK\r\n".to_string()
+        }
         Command::Multi | Command::Exec | Command::Discard => {
             // These are handled specially and should not reach here
             "+OK\r\n".to_string()
@@ -940,6 +948,7 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
     let mut queued_commands: Vec<Command> = Vec::new();
 
     // Track subscription state for this connection
+    let mut in_subscribe_mode = false;
     let mut subscribed_channels: HashSet<String> = HashSet::new();
     let mut subscription_rx: Option<mpsc::Receiver<(String, String)>> = None;
     let mut subscription_tx: Option<mpsc::Sender<(String, String)>> = None;
@@ -984,6 +993,27 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
         let commands = parse_commands(&request);
 
         for command in commands {
+            // Check if command is allowed in subscribe mode
+            if in_subscribe_mode {
+                let allowed = matches!(command,
+                    Command::Subscribe(_) |
+                    Command::Unsubscribe(_) |
+                    Command::PSubscribe(_) |
+                    Command::PUnsubscribe(_) |
+                    Command::Ping |
+                    Command::Quit
+                );
+
+                if !allowed {
+                    let error_msg = format!(
+                        "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
+                        command.name()
+                    );
+                    let _ = stream.write_all(error_msg.as_bytes());
+                    continue;
+                }
+            }
+
             // Handle MULTI command specially
             if matches!(command, Command::Multi) {
                 if in_transaction {
@@ -1467,6 +1497,9 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
                 }
                 Command::Subscribe(channels) => {
                     // SUBSCRIBE command - register client to channels
+                    // Enter subscribe mode
+                    in_subscribe_mode = true;
+
                     // Create a channel for receiving published messages if not already created
                     if subscription_tx.is_none() {
                         let (tx, rx) = mpsc::channel::<(String, String)>();
@@ -1498,6 +1531,42 @@ fn handle_connection(mut stream: TcpStream, store: Arc<Mutex<Store>>, role: Arc<
 
                     drop(pubsub_lock);
                     Ok(())
+                }
+                Command::Unsubscribe(channels) => {
+                    // UNSUBSCRIBE command - remove client from channels
+                    if channels.is_empty() {
+                        // Unsubscribe from all channels
+                        subscribed_channels.clear();
+                        let response = format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
+                        stream.write_all(response.as_bytes())
+                    } else {
+                        // Unsubscribe from specific channels
+                        for channel in &channels {
+                            subscribed_channels.remove(channel);
+                            let response = format!(
+                                "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:{}\r\n",
+                                channel.len(),
+                                channel,
+                                subscribed_channels.len()
+                            );
+                            stream.write_all(response.as_bytes()).ok();
+                        }
+                        Ok(())
+                    }
+                }
+                Command::PSubscribe(_patterns) => {
+                    // Pattern-based subscribe (simplified - just acknowledge)
+                    in_subscribe_mode = true;
+                    stream.write_all(b"+OK\r\n")
+                }
+                Command::PUnsubscribe(_patterns) => {
+                    // Pattern-based unsubscribe (simplified - just acknowledge)
+                    stream.write_all(b"+OK\r\n")
+                }
+                Command::Quit => {
+                    // QUIT - close connection gracefully
+                    stream.write_all(b"+OK\r\n").ok();
+                    break;
                 }
                 Command::Multi | Command::Exec | Command::Discard => {
                     // Multi, Exec, and Discard are handled above before reaching this match
@@ -1557,9 +1626,47 @@ enum Command {
     Wait(usize, u64), // numreplicas, timeout in milliseconds
     Config(String, String), // subcommand (GET/SET), parameter
     Subscribe(Vec<String>), // channels to subscribe to
+    Unsubscribe(Vec<String>), // channels to unsubscribe from (empty = all)
+    PSubscribe(Vec<String>), // pattern-based subscribe
+    PUnsubscribe(Vec<String>), // pattern-based unsubscribe
+    Quit, // Close the connection
 }
 
 impl Command {
+    // Get the command name in lowercase
+    fn name(&self) -> &str {
+        match self {
+            Command::Ping => "ping",
+            Command::Echo(_) => "echo",
+            Command::Info(_) => "info",
+            Command::Set(_, _, _) => "set",
+            Command::Get(_) => "get",
+            Command::Incr(_) => "incr",
+            Command::RPush(_, _) => "rpush",
+            Command::LPush(_, _) => "lpush",
+            Command::LRange(_, _, _) => "lrange",
+            Command::LLen(_) => "llen",
+            Command::LPop(_, _) => "lpop",
+            Command::BLPop(_, _) => "blpop",
+            Command::Type(_) => "type",
+            Command::XAdd(_, _, _) => "xadd",
+            Command::XRange(_, _, _) => "xrange",
+            Command::XRead(_, _) => "xread",
+            Command::Multi => "multi",
+            Command::Exec => "exec",
+            Command::Discard => "discard",
+            Command::ReplConf(_) => "replconf",
+            Command::PSync(_, _) => "psync",
+            Command::Wait(_, _) => "wait",
+            Command::Config(_, _) => "config",
+            Command::Subscribe(_) => "subscribe",
+            Command::Unsubscribe(_) => "unsubscribe",
+            Command::PSubscribe(_) => "psubscribe",
+            Command::PUnsubscribe(_) => "punsubscribe",
+            Command::Quit => "quit",
+        }
+    }
+
     // Check if this is a write command that should be propagated to replicas
     fn is_write_command(&self) -> bool {
         matches!(self,
@@ -1777,6 +1884,34 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(Command::Subscribe(channels))
                 }
+            }
+            "UNSUBSCRIBE" => {
+                let mut channels = Vec::new();
+                while let Some(channel) = self.read_bulk_string() {
+                    channels.push(channel);
+                }
+                Some(Command::Unsubscribe(channels))
+            }
+            "PSUBSCRIBE" => {
+                let mut patterns = Vec::new();
+                while let Some(pattern) = self.read_bulk_string() {
+                    patterns.push(pattern);
+                }
+                if patterns.is_empty() {
+                    None
+                } else {
+                    Some(Command::PSubscribe(patterns))
+                }
+            }
+            "PUNSUBSCRIBE" => {
+                let mut patterns = Vec::new();
+                while let Some(pattern) = self.read_bulk_string() {
+                    patterns.push(pattern);
+                }
+                Some(Command::PUnsubscribe(patterns))
+            }
+            "QUIT" => {
+                Some(Command::Quit)
             }
             "RPUSH" => {
                 let key = self.read_bulk_string()?;
